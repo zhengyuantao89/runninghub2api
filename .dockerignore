@@ -1,0 +1,13 @@
+.bin
+data
+web/node_modules
+web/dist
+**/*.exe
+**/*~
+.git
+.tmp*
+tmp_*
+.env
+*.md
+scripts
+docs

@@ -1,0 +1,41 @@
+# secrets & local env
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+.auth_key.txt
+**/服务器.txt
+服务器.txt
+
+# runtime / local data
+data/
+deploy_stage/
+bin/
+*.exe
+*.exe~
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# frontend build & deps
+web/node_modules/
+web/dist/
+
+# captures / dumps / scratch
+参考/
+*.devtools
+*.har
+tmp_*
+tmp/
+*.log
+scripts/exp_*.py
+tmp_fix_lease.py
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

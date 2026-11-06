@@ -1,0 +1,23 @@
+[Unit]
+Description=runninghub2api gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rh2api
+Group=rh2api
+WorkingDirectory=/opt/runninghub2api
+EnvironmentFile=-/opt/runninghub2api/.env
+ExecStart=/opt/runninghub2api/runninghub2api
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/runninghub2api/data
+
+[Install]
+WantedBy=multi-user.target
