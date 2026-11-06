@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { Button, Input, ModalShell } from 'nanocat-ui'
 import FilterToolbar from '@/components/ai/FilterToolbar.vue'
 import MetricStrip from '@/components/ai/MetricStrip.vue'
@@ -11,18 +11,37 @@ import { api } from '@/api'
 const rows = ref([])
 const error = ref('')
 const okmsg = ref('')
-const importText = ref('{"accounts":[{"email":"a@b.com","password":"plain","status":"active","source":"manual"}]}')
+const importText = ref('{"accounts":[{"email":"a@b.com","password":"plain","status":"active","source":"manual","max_concurrency":1}]}')
 const loading = ref(false)
 const batchBusy = ref(false)
 const showImport = ref(false)
 const showAdd = ref(false)
 const keyword = ref('')
 const busyId = ref(0)
+const actionMenuId = ref(0)
 const selectedIds = ref(new Set())
 const detail = ref(null)
 const detailLoading = ref(false)
+const detailMaxConcurrency = ref(1)
+const savingConcurrency = ref(false)
 const headerCheckEl = ref(null)
 const toolbarButtonClass = 'h-8 justify-center px-3 text-xs'
+
+function toggleActionMenu(id) {
+  actionMenuId.value = actionMenuId.value === id ? 0 : id
+}
+
+function closeActionMenu() {
+  actionMenuId.value = 0
+}
+
+async function runRowAction(row, action) {
+  closeActionMenu()
+  if (action === 'detail') return openDetail(row)
+  if (action === 'ensureKey') return ensureKeyOne(row)
+  if (action === 'refresh') return refreshOne(row)
+  if (action === 'toggleStatus') return toggleStatus(row)
+}
 
 const addForm = reactive({
   email: '',
@@ -30,6 +49,7 @@ const addForm = reactive({
   access_token: '',
   api_key: '',
   remain_coins: '',
+  max_concurrency: 1,
   source: 'manual',
   status: 'active',
   external_id: '',
@@ -87,7 +107,9 @@ const detailFields = computed(() => {
     { label: '可调度', value: a.dispatchable ? '是' : '否' },
     { label: '占用中', value: a.busy ? '是' : '否' },
     { label: 'RH 币', value: dash(a.remain_coins) },
-    { label: '在途任务', value: dash(a.current_task_counts || '0') },
+    { label: '并发上限', value: dash(a.max_concurrency || 1) },
+    { label: '本网关在途', value: `${a.inflight || 0} / ${a.max_concurrency || 1}` },
+    { label: 'RH 在途', value: dash(a.current_task_counts || '0') },
     { label: 'API Type', value: dash(a.api_type) },
     { label: '来源', value: dash(a.source) },
     { label: '外部 ID', value: dash(a.external_id), copy: !!a.external_id, mono: true },
@@ -118,6 +140,7 @@ function resetAddForm() {
   addForm.access_token = ''
   addForm.api_key = ''
   addForm.remain_coins = ''
+  addForm.max_concurrency = 1
   addForm.source = 'manual'
   addForm.status = 'active'
   addForm.external_id = ''
@@ -174,12 +197,14 @@ async function doAdd() {
     if (!addForm.password && !addForm.access_token && !addForm.api_key) {
       throw new Error('密码 / Access Token / API Key 至少填一项')
     }
+    const maxConc = Math.min(64, Math.max(1, Number(addForm.max_concurrency) || 1))
     await api.createAccount({
       email,
       password: String(addForm.password || '').trim(),
       access_token: String(addForm.access_token || '').trim(),
       api_key: String(addForm.api_key || '').trim(),
       remain_coins: String(addForm.remain_coins || '').trim(),
+      max_concurrency: maxConc,
       source: String(addForm.source || 'manual').trim() || 'manual',
       status: addForm.status === 'disabled' ? 'disabled' : 'active',
       external_id: String(addForm.external_id || '').trim(),
@@ -402,10 +427,12 @@ async function openDetail(row) {
   const seq = ++detailRequestSeq
   detailLoading.value = true
   detail.value = { id: row.id, email: row.email, status: row.status }
+  detailMaxConcurrency.value = Number(row.max_concurrency) || 1
   try {
     const data = await api.getAccount(row.id)
     if (seq !== detailRequestSeq) return
     detail.value = data
+    detailMaxConcurrency.value = Number(data?.max_concurrency) || 1
   } catch (e) {
     if (seq !== detailRequestSeq) return
     error.value = e.message || String(e)
@@ -419,6 +446,25 @@ function closeDetail() {
   detailRequestSeq += 1
   detailLoading.value = false
   detail.value = null
+}
+
+async function saveDetailConcurrency() {
+  if (!detail.value?.id) return
+  error.value = ''
+  okmsg.value = ''
+  savingConcurrency.value = true
+  try {
+    const n = Math.min(64, Math.max(1, Number(detailMaxConcurrency.value) || 1))
+    const acc = await api.setAccountMaxConcurrency(detail.value.id, n)
+    detail.value = { ...detail.value, ...acc }
+    detailMaxConcurrency.value = Number(acc.max_concurrency) || n
+    okmsg.value = `${acc.email || detail.value.email} 并发上限已设为 ${detailMaxConcurrency.value}`
+    await refresh()
+  } catch (e) {
+    error.value = e.message || String(e)
+  } finally {
+    savingConcurrency.value = false
+  }
 }
 
 function copy(text) {
@@ -458,7 +504,7 @@ function tokenTone(ok) {
 }
 
 function tokenLabel(kind, ok) {
-  return ok ? `${kind}有效` : `${kind}无效`
+  return ok ? kind : `${kind}无`
 }
 
 function onHeaderCheck(e) {
@@ -471,7 +517,18 @@ watch([someFilteredSelected, headerCheckEl], () => {
   }
 })
 
-onMounted(refresh)
+function onDocClick(e) {
+  if (!e.target?.closest?.('[data-account-action-menu]')) closeActionMenu()
+}
+
+onMounted(() => {
+  document.addEventListener('click', onDocClick)
+  refresh()
+})
+
+onUnmounted(() => {
+  document.removeEventListener('click', onDocClick)
+})
 </script>
 
 <template>
@@ -492,7 +549,7 @@ onMounted(refresh)
         </FilterToolbar>
         <div class="flex flex-wrap items-center justify-between gap-3">
           <p class="text-xs text-muted-foreground">
-            共 {{ filtered.length }} 个账号 · 已选 {{ selectedCount }} · 每号并发上限 1
+            共 {{ filtered.length }} 个账号 · 已选 {{ selectedCount }} · 并发可在详情按号设置（默认 1）
           </p>
           <div class="flex flex-wrap gap-2">
             <Button
@@ -568,7 +625,7 @@ onMounted(refresh)
       <p v-if="error && !showImport && !showAdd && !detail" class="text-sm text-[hsl(var(--tone-error-strong))]">{{ error }}</p>
 
       <TableShell>
-        <table class="w-full min-w-[1520px] text-left text-sm">
+        <table class="w-full min-w-[1280px] text-left text-sm">
           <thead class="text-xs uppercase tracking-[0.16em] text-muted-foreground">
             <tr>
               <th class="w-10 py-3 pr-3">
@@ -587,14 +644,15 @@ onMounted(refresh)
               <th class="py-3 pr-5">RH币</th>
               <th class="py-3 pr-5">每日积分</th>
               <th class="py-3 pr-5">指纹</th>
-              <th class="py-3 pr-5">出口</th>
-              <th class="py-3 pr-5">在途</th>
-              <th class="py-3 pr-5">Key</th>
-              <th class="py-3 pr-5">Token</th>
-              <th class="py-3 pr-5">冷却</th>
-              <th class="py-3 pr-5">失败</th>
+              <th class="py-3 px-3 text-center">出口</th>
+              <th class="py-3 px-3 text-center">并发</th>
+              <th class="py-3 px-3 text-center">RH在途</th>
+              <th class="py-3 px-3 text-center">Key</th>
+              <th class="py-3 px-3 text-center">Token</th>
+              <th class="py-3 px-3 text-center">冷却</th>
+              <th class="py-3 px-3 text-center">失败</th>
               <th class="py-3 pr-5">来源</th>
-              <th class="py-3 text-right">操作</th>
+              <th class="py-3 pl-3 text-center">操作</th>
             </tr>
           </thead>
           <tbody class="text-sm text-foreground">
@@ -630,62 +688,77 @@ onMounted(refresh)
                   :label="a.has_fingerprint ? '有指纹' : '无'"
                 />
               </td>
-              <td class="py-3 pr-5 font-mono text-xs text-muted-foreground">{{ a.egress_label || '—' }}</td>
-              <td class="py-3 pr-5">{{ a.current_task_counts || '0' }}</td>
-              <td class="py-3 pr-5">
-                <TonePill
-                  :tone="a.has_api_key ? 'success' : 'error'"
-                  :label="a.has_api_key ? (a.api_type || '有Key') : '无Key'"
-                />
+              <td class="px-3 py-3 text-center font-mono text-xs text-muted-foreground">{{ a.egress_label || '—' }}</td>
+              <td class="px-3 py-3 text-center font-mono text-xs">
+                {{ a.inflight || 0 }}/{{ a.max_concurrency || 1 }}
               </td>
-              <td class="py-3 pr-5">
-                <div class="flex flex-wrap gap-1">
+              <td class="px-3 py-3 text-center">{{ a.current_task_counts || '0' }}</td>
+              <td class="px-3 py-3 text-center">
+                <div class="inline-flex justify-center">
+                  <TonePill
+                    :tone="a.has_api_key ? 'success' : 'error'"
+                    :label="a.has_api_key ? (a.api_type || '有Key') : '无Key'"
+                  />
+                </div>
+              </td>
+              <td class="px-3 py-3 text-center">
+                <div class="inline-flex flex-wrap justify-center gap-1">
                   <TonePill :tone="tokenTone(a.has_access_token)" :label="tokenLabel('AT', a.has_access_token)" />
                   <TonePill :tone="tokenTone(a.has_refresh_token)" :label="tokenLabel('RT', a.has_refresh_token)" />
                 </div>
               </td>
-              <td class="py-3 pr-5 font-mono text-xs text-muted-foreground">{{ a.cooldown_until || '—' }}</td>
-              <td class="py-3 pr-5">{{ a.fail_count }}</td>
+              <td class="px-3 py-3 text-center font-mono text-xs text-muted-foreground">{{ a.cooldown_until || '—' }}</td>
+              <td class="px-3 py-3 text-center">{{ a.fail_count }}</td>
               <td class="py-3 pr-5 text-muted-foreground">{{ a.source || '—' }}</td>
-              <td class="py-3 text-right">
-                <div class="flex flex-wrap justify-end gap-2">
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    :disabled="busyId === a.id || batchBusy"
-                    @click="openDetail(a)"
+              <td class="relative px-3 py-3 text-center" data-account-action-menu>
+                <Button
+                  size="xs"
+                  variant="outline"
+                  :disabled="busyId === a.id || batchBusy"
+                  @click.stop="toggleActionMenu(a.id)"
+                >
+                  操作
+                </Button>
+                <div
+                  v-if="actionMenuId === a.id"
+                  class="absolute right-3 z-20 mt-1 min-w-[7.5rem] overflow-hidden rounded-xl border border-border bg-card py-1 text-left shadow-lg"
+                >
+                  <button
+                    type="button"
+                    class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
+                    @click="runRowAction(a, 'detail')"
                   >
                     详情
-                  </Button>
-                  <Button
-                    size="xs"
-                    variant="outline"
+                  </button>
+                  <button
+                    type="button"
+                    class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
                     :disabled="busyId === a.id || batchBusy"
-                    @click="ensureKeyOne(a)"
+                    @click="runRowAction(a, 'ensureKey')"
                   >
                     {{ a.has_api_key ? '重置Key' : '补Key' }}
-                  </Button>
-                  <Button
-                    size="xs"
-                    variant="outline"
+                  </button>
+                  <button
+                    type="button"
+                    class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
                     :disabled="busyId === a.id || batchBusy"
-                    @click="refreshOne(a)"
+                    @click="runRowAction(a, 'refresh')"
                   >
                     刷新
-                  </Button>
-                  <Button
-                    size="xs"
-                    variant="outline"
+                  </button>
+                  <button
+                    type="button"
+                    class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
                     :disabled="busyId === a.id || batchBusy"
-                    @click="toggleStatus(a)"
+                    @click="runRowAction(a, 'toggleStatus')"
                   >
                     {{ a.status === 'active' ? '禁用' : '启用' }}
-                  </Button>
+                  </button>
                 </div>
               </td>
             </tr>
             <tr v-if="!filtered.length">
-              <td colspan="12" class="py-8 text-center text-sm text-muted-foreground">
+              <td colspan="16" class="py-8 text-center text-sm text-muted-foreground">
                 暂无账号。可单独添加、批量导入，或通过推送接口同步。
               </td>
             </tr>
@@ -719,10 +792,14 @@ onMounted(refresh)
           <span class="text-xs font-medium text-muted-foreground">API Key（可选）</span>
           <Input v-model="addForm.api_key" type="text" block placeholder="消费级 32 位 key" />
         </label>
-        <div class="grid grid-cols-2 gap-3">
+        <div class="grid grid-cols-3 gap-3">
           <label class="block space-y-1.5">
             <span class="text-xs font-medium text-muted-foreground">RH 币（可选）</span>
             <Input v-model="addForm.remain_coins" type="text" block placeholder="如 1100" />
+          </label>
+          <label class="block space-y-1.5">
+            <span class="text-xs font-medium text-muted-foreground">并发上限</span>
+            <Input v-model="addForm.max_concurrency" type="number" block placeholder="1" />
           </label>
           <label class="block space-y-1.5">
             <span class="text-xs font-medium text-muted-foreground">状态</span>
@@ -735,6 +812,7 @@ onMounted(refresh)
             </select>
           </label>
         </div>
+        <p class="text-xs text-muted-foreground">付费号可把并发上限设为平台允许值（如 5），免费号保持 1。</p>
         <div class="grid grid-cols-2 gap-3">
           <label class="block space-y-1.5">
             <span class="text-xs font-medium text-muted-foreground">来源</span>
@@ -811,6 +889,22 @@ onMounted(refresh)
             :label="tokenLabel('RT', detail.has_refresh_token || !!detail.refresh_token)"
           />
         </div>
+        <div class="flex flex-wrap items-end gap-2 rounded-xl border border-border/70 bg-muted/20 px-3 py-2">
+          <label class="min-w-[8rem] flex-1 space-y-1.5">
+            <span class="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">并发上限</span>
+            <Input v-model="detailMaxConcurrency" type="number" block min="1" max="64" />
+          </label>
+          <Button
+            size="sm"
+            variant="outline"
+            :root-class="toolbarButtonClass"
+            :disabled="savingConcurrency || busyId === detail.id || batchBusy"
+            @click="saveDetailConcurrency"
+          >
+            {{ savingConcurrency ? '保存中…' : '保存并发' }}
+          </Button>
+        </div>
+        <p v-if="error" class="text-sm text-[hsl(var(--tone-error-strong))]">{{ error }}</p>
         <dl class="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div
             v-for="f in detailFields"

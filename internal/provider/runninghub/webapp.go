@@ -41,12 +41,14 @@ type RunInput struct {
 	NodeInfoList []NodeInput
 	// ExtraImages maps nodeId (or "default") -> local image bytes for IMAGE fields.
 	ExtraImages map[string][]byte
-	PollEvery   time.Duration
-	Timeout     time.Duration
-	BaseURL     string
+	// AccessPassword for RH apps with encrypted access (accessEncrypted).
+	AccessPassword string
+	PollEvery      time.Duration
+	Timeout        time.Duration
+	BaseURL        string
 	// HTTP when set, used as the RH client's transport (sticky egress proxy).
-	HTTP        *http.Client
-	OnProgress  func(Progress)
+	HTTP       *http.Client
+	OnProgress func(Progress)
 }
 
 type Progress struct {
@@ -202,12 +204,18 @@ func SubmitWebappVideo(in RunInput) (*Session, error) {
 		}
 	}
 
-	created, err := client.WebappCreate(map[string]any{
+	createBody := map[string]any{
 		"webappId":         webappID,
 		"inputs":           inputs,
 		"clientId":         makeClientID(),
 		"usePersonalQueue": false,
-	})
+	}
+	if pwd := strings.TrimSpace(in.AccessPassword); pwd != "" {
+		// RH OpenAPI 字段名为 accessPassword；网页 create 同步带上
+		createBody["accessPassword"] = pwd
+		createBody["password"] = pwd
+	}
+	created, err := client.WebappCreate(createBody)
 	if err != nil {
 		return nil, err
 	}
@@ -387,6 +395,11 @@ func normalizeDemoFromApiCall(webappID string, raw map[string]any) (map[string]a
 	}
 	name := firstNonEmpty(asString(data["webappName"]), asString(data["name"]))
 	out := buildDemoPayload(webappID, name, asString(data["description"]), nodesRaw, "apiCallDemo", asString(data["curl"]))
+	if enc, ok := data["accessEncrypted"].(bool); ok && enc {
+		out["access_encrypted"] = true
+	} else if s := strings.ToLower(asString(data["accessEncrypted"])); s == "true" || s == "1" {
+		out["access_encrypted"] = true
+	}
 	return out, true
 }
 

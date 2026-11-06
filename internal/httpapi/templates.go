@@ -12,15 +12,17 @@ import (
 )
 
 // demoFromSavedTemplate maps a stored template into the same shape as FetchWebappDemo.
+// Access password is NOT returned to downstream; gateway injects it on submit.
 func demoFromSavedTemplate(tpl store.WebappTemplate) map[string]any {
 	out := map[string]any{
-		"webapp_id":      tpl.WebappID,
-		"name":           tpl.Name,
-		"description":    tpl.Description,
-		"source":         "saved_template",
-		"cached":         true,
-		"template_id":    tpl.ID,
-		"node_info_list": json.RawMessage("[]"),
+		"webapp_id":           tpl.WebappID,
+		"name":                tpl.Name,
+		"description":         tpl.Description,
+		"source":              "saved_template",
+		"cached":              true,
+		"template_id":         tpl.ID,
+		"has_access_password": strings.TrimSpace(tpl.AccessPassword) != "",
+		"node_info_list":      json.RawMessage("[]"),
 	}
 	if len(tpl.NodeInfoList) > 0 {
 		out["node_info_list"] = tpl.NodeInfoList
@@ -86,13 +88,14 @@ func (s *Server) handleAdminTemplateByID(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) saveWebappTemplate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		WebappID     string          `json:"webapp_id"`
-		Name         string          `json:"name"`
-		Description  string          `json:"description"`
-		Source       string          `json:"source"`
-		Note         string          `json:"note"`
-		NodeInfoList json.RawMessage `json:"node_info_list"`
-		Example      json.RawMessage `json:"example"`
+		WebappID       string          `json:"webapp_id"`
+		Name           string          `json:"name"`
+		Description    string          `json:"description"`
+		Source         string          `json:"source"`
+		Note           string          `json:"note"`
+		AccessPassword string          `json:"access_password"`
+		NodeInfoList   json.RawMessage `json:"node_info_list"`
+		Example        json.RawMessage `json:"example"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
@@ -155,13 +158,14 @@ func (s *Server) saveWebappTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	saved, err := s.store.UpsertWebappTemplate(store.WebappTemplate{
-		WebappID:     webappID,
-		Name:         name,
-		Description:  desc,
-		Source:       source,
-		Note:         strings.TrimSpace(body.Note),
-		NodeInfoJSON: nodeJSON,
-		ExampleJSON:  exampleJSON,
+		WebappID:       webappID,
+		Name:           name,
+		Description:    desc,
+		Source:         source,
+		Note:           strings.TrimSpace(body.Note),
+		AccessPassword: strings.TrimSpace(body.AccessPassword),
+		NodeInfoJSON:   nodeJSON,
+		ExampleJSON:    exampleJSON,
 	})
 	if err != nil {
 		status := http.StatusInternalServerError

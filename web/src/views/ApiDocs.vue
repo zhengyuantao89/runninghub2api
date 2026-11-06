@@ -21,35 +21,36 @@ const sections = computed(() => [
   {
     id: 'downstream-flow',
     title: '下游接入（三步）',
-    desc: '把下面示例直接发给对接方。他们只用系统设置里的 API Key，不需要 RunningHub 账号或 RH Key。webappId 从 RH 应用页 URL 复制。',
+    desc: '每个 RH 应用节点不同，不要写死请求体。先拉该应用的 demo，再改 example.body 提交。对接方只用系统 API Key；加密应用密码在控制台模板里存好即可，下游不必再传。',
     examples: [
       {
-        label: '① 拉取应用节点模板',
+        label: '① 拉取本应用节点模板',
         lang: 'bash',
-        code: `# 把 <webappId> 换成实际应用 ID
+        code: `# webappId 从 RH 应用页 URL 复制，例如 ai-detail/2054244556132102145
 curl -s ${base.value}/v1/webapps/<webappId>/demo \\
   -H "Authorization: Bearer ${apiKey.value}"
 
 # 响应里重点看：
-# - node_info_list：各输入节点
-# - example.body：可直接改完再提交的 JSON`,
+# - node_info_list：本应用输入节点（以本次为准）
+# - example.body：拷出来改 fieldValue 再提交
+# - has_access_password：true 表示后台已存访问密码，提交时网关自动注入`,
       },
       {
-        label: '② 按模板提交任务',
+        label: '② 按 demo 改 body 后提交',
         lang: 'bash',
-        code: `curl -s -X POST ${base.value}/v1/videos \\
+        code: `# 不要照抄固定 nodeId；把上一步 example.body 存成 payload.json 再改
+curl -s -X POST ${base.value}/v1/videos \\
   -H "Authorization: Bearer ${apiKey.value}" \\
   -H "Content-Type: application/json" \\
-  -d '{
-    "webapp_id": "<webappId>",
-    "node_info_list": [
-      { "nodeId": "266", "fieldName": "image", "fieldType": "IMAGE", "fieldValue": "__upload__" },
-      { "nodeId": "249", "fieldName": "value", "fieldValue": "你的提示词" }
-    ],
-    "image_base64": "<图片 base64，IMAGE 节点需要时>"
-  }'
+  -d @payload.json
 
-# 也可用 multipart：node_info_list=JSON字符串 + image=@文件
+# payload.json 形态（节点必须来自该应用的 demo）：
+# {
+#   "webapp_id": "<webappId>",
+#   "node_info_list": [ /* 来自 demo，只改 fieldValue */ ],
+#   "image_base64": "<IMAGE 节点需要时>"
+# }
+# multipart 也行：node_info_list=JSON字符串 + image=@文件
 # IMAGE 节点 fieldValue 填 __upload__`,
       },
       {
@@ -98,22 +99,23 @@ X-API-Key: ${apiKey.value}`,
   {
     id: 'webapp-demo',
     title: '拉取 AI 应用调用示例',
-    desc: '若后台已保存该 webappId 模板，直接返回本地示例（不耗号池 RH Key）；未保存时再用 RH apiCallDemo / 公开 detail。加 ?refresh=1 可强制刷新。下游只需我们的 API Key。',
+    desc: '先拉再改：响应里的 node_info_list / example.body 只对当前 webappId 有效。已保存模板则 cached=true；加密应用在控制台模板存密码后 has_access_password=true。',
     examples: [
       {
         label: 'curl',
         lang: 'bash',
-        code: `curl -s ${base.value}/v1/webapps/2099427470494662657/demo \\
+        code: `curl -s ${base.value}/v1/webapps/<webappId>/demo \\
   -H "Authorization: Bearer ${apiKey.value}"`,
       },
       {
         label: '响应要点',
         lang: 'json',
         code: `{
-  "webapp_id": "2099427470494662657",
+  "webapp_id": "<webappId>",
   "name": "应用名",
-  "source": "apiCallDemo",
-  "node_info_list": [ { "nodeId": "266", "fieldName": "image", "fieldType": "IMAGE", "...": "..." } ],
+  "source": "apiCallDemo | saved_template",
+  "has_access_password": false,
+  "node_info_list": [ { "nodeId": "...", "fieldName": "...", "fieldType": "IMAGE|LIST|..." } ],
   "example": { "path": "/v1/videos", "body": { "webapp_id": "...", "node_info_list": [] } }
 }`,
       },
@@ -121,11 +123,20 @@ X-API-Key: ${apiKey.value}`,
   },
   {
     id: 'create-video',
-    title: '创建视频任务',
-    desc: '兼容旧版 prompt+image；也支持通用 webapp_id + node_info_list（先调 /demo 拿节点）。有空闲号时同步提交并返回 rh_task_id。',
+    title: '创建任务',
+    desc: '推荐：用 /demo 返回的 example.body 改完再 POST。旧版 prompt+image 仅兼容默认应用。加密应用密码优先用模板里保存的，也可临时传 access_password。',
     examples: [
       {
-        label: 'curl · 旧版 multipart（默认应用）',
+        label: 'curl · 按模板 JSON（推荐）',
+        lang: 'bash',
+        code: `# 节点必须来自该 webappId 的 /demo，勿复用其它应用的 nodeId
+curl -s -X POST ${base.value}/v1/videos \\
+  -H "Authorization: Bearer ${apiKey.value}" \\
+  -H "Content-Type: application/json" \\
+  -d @payload-from-demo.json`,
+      },
+      {
+        label: 'curl · 旧版 multipart（仅默认应用）',
         lang: 'bash',
         code: `curl -s -X POST ${base.value}/v1/videos \\
   -H "Authorization: Bearer ${apiKey.value}" \\
@@ -133,23 +144,6 @@ X-API-Key: ${apiKey.value}`,
   -F "image=@./demo.png" \\
   -F "duration=8" \\
   -F "aspect_ratio=3:4 (Portrait Standard)"`,
-      },
-      {
-        label: 'curl · 通用 JSON（任意 AI 应用）',
-        lang: 'bash',
-        code: `curl -s -X POST ${base.value}/v1/videos \\
-  -H "Authorization: Bearer ${apiKey.value}" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "webapp_id": "2065271095023980545",
-    "node_info_list": [
-      { "nodeId": "75", "fieldName": "image", "fieldType": "IMAGE", "fieldValue": "__upload__" },
-      { "nodeId": "6", "fieldName": "text", "fieldValue": "正向提示词" },
-      { "nodeId": "7", "fieldName": "text", "fieldValue": "反向提示词" },
-      { "nodeId": "90", "fieldName": "value", "fieldValue": "5" }
-    ],
-    "image_base64": "<首帧图 base64>"
-  }'`,
       },
       {
         label: '成功响应（已拿到上游 ID）',

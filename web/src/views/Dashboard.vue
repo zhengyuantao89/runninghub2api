@@ -257,7 +257,7 @@ onUnmounted(() => clearInterval(timer))
                   <th class="py-2 pr-3">账号</th>
                   <th class="py-2 pr-3">状态</th>
                   <th class="py-2 pr-3">RH币</th>
-                  <th class="py-2">在途</th>
+                  <th class="py-2">并发</th>
                 </tr>
               </thead>
               <tbody>
@@ -267,7 +267,9 @@ onUnmounted(() => clearInterval(timer))
                     <StatusPill :tone="poolTone(a)" :label="poolLabel(a)" />
                   </td>
                   <td class="py-2.5 pr-3 font-medium">{{ a.remain_coins || '—' }}</td>
-                  <td class="py-2.5 text-muted-foreground">{{ a.current_task_counts || '0' }}</td>
+                  <td class="py-2.5 font-mono text-xs text-muted-foreground">
+                    {{ a.inflight || 0 }}/{{ a.max_concurrency || 1 }}
+                  </td>
                 </tr>
                 <tr v-if="!accountRows.length">
                   <td colspan="4" class="py-8 text-center text-sm text-muted-foreground">暂无账号统计</td>

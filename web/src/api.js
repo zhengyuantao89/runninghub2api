@@ -92,6 +92,11 @@ export const api = {
     }),
   disableAccount: (id) => request(`/admin/accounts/${id}/disable`, { method: 'POST' }),
   enableAccount: (id) => request(`/admin/accounts/${id}/enable`, { method: 'POST' }),
+  setAccountMaxConcurrency: (id, max_concurrency) =>
+    request(`/admin/accounts/${id}/max-concurrency`, {
+      method: 'POST',
+      body: { max_concurrency: Number(max_concurrency) || 1 },
+    }),
   listAdminTasks: () => request('/admin/tasks'),
   listVideos: () => request('/v1/videos'),
   getVideo: (id) => request(`/v1/videos/${id}`),

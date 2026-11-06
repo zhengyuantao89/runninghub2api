@@ -237,6 +237,7 @@ func (w *Worker) runOne(task store.VideoTask) error {
 
 	_ = w.store.UpdateTaskRunning(task.ID, acc.ID, acc.Email, "")
 
+	webappID := first(task.WebappID, w.cfg.WebappID)
 	in := runninghub.RunInput{
 		Email:           acc.Email,
 		Password:        acc.Password,
@@ -245,9 +246,10 @@ func (w *Worker) runOne(task store.VideoTask) error {
 		FingerprintJSON: acc.FingerprintJSON,
 		Prompt:          task.Prompt,
 		ImagePath:       task.ImagePath,
-		WebappID:        first(task.WebappID, w.cfg.WebappID),
+		WebappID:        webappID,
 		Duration:        task.Duration,
 		AspectRatio:     task.AspectRatio,
+		AccessPassword:  w.store.GetWebappAccessPassword(webappID),
 		NodeInfoList:    parseNodeInfoList(task.NodeInfoJSON),
 		BaseURL:         w.cfg.BaseURL,
 		OnProgress: func(p runninghub.Progress) {

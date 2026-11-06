@@ -315,6 +315,7 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 	webappID := s.cfg.WebappID
 	duration := "8"
 	aspect := "3:4 (Portrait Standard)"
+	accessPassword := ""
 	var imagePath string
 	var nodeInfoList []runninghub.NodeInput
 	extraImages := map[string][]byte{}
@@ -334,6 +335,9 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 		}
 		if v := r.FormValue("aspect_ratio"); v != "" {
 			aspect = v
+		}
+		if v := strings.TrimSpace(r.FormValue("access_password")); v != "" {
+			accessPassword = v
 		}
 		if raw := strings.TrimSpace(r.FormValue("node_info_list")); raw != "" {
 			if err := json.Unmarshal([]byte(raw), &nodeInfoList); err != nil {
@@ -379,14 +383,15 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		var body struct {
-			Prompt       string                `json:"prompt"`
-			ImagePath    string                `json:"image_path"`
-			ImageBase64  string                `json:"image_base64"`
-			ImagesBase64 map[string]string     `json:"images_base64"`
-			WebappID     string                `json:"webapp_id"`
-			Duration     string                `json:"duration"`
-			AspectRatio  string                `json:"aspect_ratio"`
-			NodeInfoList []runninghub.NodeInput `json:"node_info_list"`
+			Prompt         string                 `json:"prompt"`
+			ImagePath      string                 `json:"image_path"`
+			ImageBase64    string                 `json:"image_base64"`
+			ImagesBase64   map[string]string      `json:"images_base64"`
+			WebappID       string                 `json:"webapp_id"`
+			Duration       string                 `json:"duration"`
+			AspectRatio    string                 `json:"aspect_ratio"`
+			AccessPassword string                 `json:"access_password"`
+			NodeInfoList   []runninghub.NodeInput `json:"node_info_list"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
@@ -402,6 +407,9 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.AspectRatio != "" {
 			aspect = body.AspectRatio
+		}
+		if strings.TrimSpace(body.AccessPassword) != "" {
+			accessPassword = strings.TrimSpace(body.AccessPassword)
 		}
 		if body.ImagePath != "" {
 			imagePath = body.ImagePath
@@ -503,6 +511,9 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = s.store.UpdateTaskRunning(id, acc.ID, acc.Email, "")
+	if accessPassword == "" {
+		accessPassword = s.store.GetWebappAccessPassword(webappID)
+	}
 	in := runninghub.RunInput{
 		Email:           acc.Email,
 		Password:        acc.Password,
@@ -514,6 +525,7 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 		WebappID:        webappID,
 		Duration:        duration,
 		AspectRatio:     aspect,
+		AccessPassword:  accessPassword,
 		NodeInfoList:    nodeInfoList,
 		ExtraImages:     extraImages,
 		BaseURL:         s.cfg.BaseURL,
@@ -789,6 +801,33 @@ func (s *Server) handleAdminAccountByID(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusOK, acc)
 	case action == "enable" && r.Method == http.MethodPost:
 		_ = s.store.EnableAccount(id)
+		acc, err := s.store.GetAccount(id)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+			return
+		}
+		acc.PublicView()
+		writeJSON(w, http.StatusOK, acc)
+	case action == "max-concurrency" && r.Method == http.MethodPost:
+		var body struct {
+			MaxConcurrency int `json:"max_concurrency"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+			return
+		}
+		if body.MaxConcurrency < 1 || body.MaxConcurrency > 64 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "max_concurrency 需在 1..64"})
+			return
+		}
+		if err := s.store.SetAccountMaxConcurrency(id, body.MaxConcurrency); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
 		acc, err := s.store.GetAccount(id)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})

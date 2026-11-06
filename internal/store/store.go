@@ -28,7 +28,7 @@ type Account struct {
 	Identify          string `json:"identify,omitempty"`
 	RHUserID          string `json:"rh_user_id,omitempty"`
 	RemainCoins       string `json:"remain_coins,omitempty"`
-	CurrentTaskCounts string `json:"current_task_counts,omitempty"`
+	CurrentTaskCounts string `json:"current_task_counts,omitempty"` // RH 侧上报，仅展示
 	APIType           string `json:"api_type,omitempty"`
 	LastBalanceAt     string `json:"last_balance_at,omitempty"`
 	LastLoginCoinAt   string `json:"last_login_coin_at,omitempty"` // Asia/Shanghai date YYYY-MM-DD
@@ -37,6 +37,8 @@ type Account struct {
 	FingerprintJSON   string `json:"fingerprint_json,omitempty"`
 	EgressID          int64  `json:"egress_id,omitempty"`
 	EgressLabel       string `json:"egress_label,omitempty"` // host:port for list/UI
+	MaxConcurrency    int    `json:"max_concurrency"`          // 本网关每号并发上限，默认 1
+	Inflight          int    `json:"inflight"`                 // 本网关已占用槽位数
 	Status            string `json:"status"`
 	Source            string `json:"source"`
 	ExternalID        string `json:"external_id,omitempty"`
@@ -53,6 +55,14 @@ type Account struct {
 	Dispatchable      bool   `json:"dispatchable"`
 	UpdatedAt         string `json:"updated_at"`
 	CreatedAt         string `json:"created_at"`
+}
+
+// MaxSlots returns the effective per-account concurrency cap (>=1).
+func (a Account) MaxSlots() int {
+	if a.MaxConcurrency < 1 {
+		return 1
+	}
+	return a.MaxConcurrency
 }
 
 type VideoTask struct {
@@ -162,11 +172,15 @@ CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status, cooldown_unti
 		{"fingerprint_json", "fingerprint_json TEXT NOT NULL DEFAULT ''"},
 		{"last_login_coin_at", "last_login_coin_at TEXT NOT NULL DEFAULT ''"},
 		{"egress_id", "egress_id INTEGER NOT NULL DEFAULT 0"},
+		{"max_concurrency", "max_concurrency INTEGER NOT NULL DEFAULT 1"},
+		{"inflight", "inflight INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := s.addColumnIfMissing("accounts", col.name, col.ddl); err != nil {
 			return err
 		}
 	}
+	// 旧数据：若仍占用租约但 inflight=0，补 1，避免升级后立刻重复派发
+	_, _ = s.db.Exec(`UPDATE accounts SET inflight=1 WHERE inflight=0 AND lease_task_id!='' AND lease_until!=''`)
 	if _, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS egress_nodes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -265,6 +279,9 @@ CREATE INDEX IF NOT EXISTS idx_webapp_templates_updated ON webapp_templates(upda
 `); err != nil {
 		return err
 	}
+	if err := s.addColumnIfMissing("webapp_templates", "access_password", "access_password TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -292,7 +309,7 @@ func (s *Store) addColumnIfMissing(table, name, ddl string) error {
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
 
-const accountSelect = `SELECT id,email,password,access_token,refresh_token,api_key,identify,rh_user_id,remain_coins,current_task_counts,api_type,last_balance_at,last_login_coin_at,anonymous_id,device_id,fingerprint_json,egress_id,status,source,external_id,cooldown_until,fail_count,last_error,lease_task_id,lease_until,created_at,updated_at FROM accounts`
+const accountSelect = `SELECT id,email,password,access_token,refresh_token,api_key,identify,rh_user_id,remain_coins,current_task_counts,api_type,last_balance_at,last_login_coin_at,anonymous_id,device_id,fingerprint_json,egress_id,max_concurrency,inflight,status,source,external_id,cooldown_until,fail_count,last_error,lease_task_id,lease_until,created_at,updated_at FROM accounts`
 
 const taskSelect = `SELECT id,status,prompt,image_path,webapp_id,duration,aspect_ratio,node_info_json,account_id,account_email,rh_task_id,rh_status,queue_index,queue_count,progress_text,file_url,preview_url,error_code,error,attempts,created_at,updated_at,finished_at FROM video_tasks`
 
@@ -307,10 +324,18 @@ func (s *Store) UpsertAccount(a Account) (Account, error) {
 	if a.Source == "" {
 		a.Source = "manual"
 	}
+	setMax := a.MaxConcurrency > 0
+	maxConc := a.MaxConcurrency
+	if maxConc < 1 {
+		maxConc = 1
+	}
+	if maxConc > 64 {
+		maxConc = 64
+	}
 	ts := now()
 	_, err := s.db.Exec(`
-INSERT INTO accounts(email,password,access_token,refresh_token,api_key,identify,rh_user_id,remain_coins,current_task_counts,api_type,last_balance_at,anonymous_id,device_id,fingerprint_json,status,source,external_id,created_at,updated_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+INSERT INTO accounts(email,password,access_token,refresh_token,api_key,identify,rh_user_id,remain_coins,current_task_counts,api_type,last_balance_at,anonymous_id,device_id,fingerprint_json,max_concurrency,status,source,external_id,created_at,updated_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(email) DO UPDATE SET
   password=CASE WHEN excluded.password='' THEN accounts.password ELSE excluded.password END,
   access_token=CASE WHEN excluded.access_token='' THEN accounts.access_token ELSE excluded.access_token END,
@@ -325,11 +350,12 @@ ON CONFLICT(email) DO UPDATE SET
   anonymous_id=CASE WHEN excluded.anonymous_id='' THEN accounts.anonymous_id ELSE excluded.anonymous_id END,
   device_id=CASE WHEN excluded.device_id='' THEN accounts.device_id ELSE excluded.device_id END,
   fingerprint_json=CASE WHEN excluded.fingerprint_json='' THEN accounts.fingerprint_json ELSE excluded.fingerprint_json END,
+  max_concurrency=CASE WHEN ? THEN excluded.max_concurrency ELSE accounts.max_concurrency END,
   status=excluded.status,
   source=excluded.source,
   external_id=CASE WHEN excluded.external_id='' THEN accounts.external_id ELSE excluded.external_id END,
   updated_at=excluded.updated_at
-`, a.Email, a.Password, a.AccessToken, a.RefreshToken, a.APIKey, a.Identify, a.RHUserID, a.RemainCoins, a.CurrentTaskCounts, a.APIType, a.LastBalanceAt, a.AnonymousID, a.DeviceID, a.FingerprintJSON, a.Status, a.Source, a.ExternalID, ts, ts)
+`, a.Email, a.Password, a.AccessToken, a.RefreshToken, a.APIKey, a.Identify, a.RHUserID, a.RemainCoins, a.CurrentTaskCounts, a.APIType, a.LastBalanceAt, a.AnonymousID, a.DeviceID, a.FingerprintJSON, maxConc, a.Status, a.Source, a.ExternalID, ts, ts, setMax)
 	if err != nil {
 		return Account{}, err
 	}
@@ -397,13 +423,21 @@ func (s *Store) ListAccounts() ([]Account, error) {
 	return out, rows.Err()
 }
 
+func (s *Store) reclaimExpiredLeases(nowTs time.Time) {
+	_, _ = s.db.Exec(
+		`UPDATE accounts SET inflight=0, lease_task_id='', lease_until='', updated_at=? WHERE lease_until!='' AND lease_until < ? AND inflight>0`,
+		nowTs.Format(time.RFC3339), nowTs.Format(time.RFC3339),
+	)
+}
+
 func (s *Store) ListDispatchableAccounts() ([]Account, error) {
+	nowTs := time.Now().UTC()
+	s.reclaimExpiredLeases(nowTs)
 	rows, err := s.db.Query(accountSelect + ` WHERE status='active' ORDER BY updated_at ASC, id ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	nowTs := time.Now().UTC()
 	var out []Account
 	for rows.Next() {
 		a, err := s.scanAccountRows(rows)
@@ -416,11 +450,8 @@ func (s *Store) ListDispatchableAccounts() ([]Account, error) {
 		if until, err := time.Parse(time.RFC3339, a.CooldownUntil); err == nil && until.After(nowTs) {
 			continue
 		}
-		if until, err := time.Parse(time.RFC3339, a.LeaseUntil); err == nil && until.After(nowTs) && a.LeaseTaskID != "" {
-			continue
-		}
-		// 统一并发/在途上限 = 1
-		if parseTaskCount(a.CurrentTaskCounts) >= 1 {
+		// 本网关槽位未满才可再派
+		if a.Inflight >= a.MaxSlots() {
 			continue
 		}
 		// 已刷过余额且积分为 0：无法再生成
@@ -441,36 +472,24 @@ func (a *Account) PublicView() {
 }
 
 func (a *Account) decoratePublic(nowTs time.Time) {
+	if a.MaxConcurrency < 1 {
+		a.MaxConcurrency = 1
+	}
+	if a.Inflight < 0 {
+		a.Inflight = 0
+	}
 	a.HasAPIKey = strings.TrimSpace(a.APIKey) != ""
 	a.HasAccessToken = strings.TrimSpace(a.AccessToken) != ""
 	a.HasRefreshToken = strings.TrimSpace(a.RefreshToken) != ""
 	a.HasFingerprint = strings.TrimSpace(a.FingerprintJSON) != ""
-	busy := false
-	if until, err := time.Parse(time.RFC3339, a.LeaseUntil); err == nil && until.After(nowTs) && a.LeaseTaskID != "" {
-		busy = true
-	}
-	if parseTaskCount(a.CurrentTaskCounts) >= 1 {
-		busy = true
-	}
-	a.Busy = busy
+	slotsFull := a.Inflight >= a.MaxSlots()
+	a.Busy = a.Inflight > 0
 	cooling := false
 	if until, err := time.Parse(time.RFC3339, a.CooldownUntil); err == nil && until.After(nowTs) {
 		cooling = true
 	}
 	noCoins := a.LastBalanceAt != "" && parseCoins(a.RemainCoins) <= 0
-	a.Dispatchable = a.Status == "active" && !busy && !cooling && !noCoins && (a.Password != "" || a.AccessToken != "" || a.HasAPIKey)
-}
-
-func parseTaskCount(s string) int {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0
-	}
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return 0
-	}
-	return n
+	a.Dispatchable = a.Status == "active" && !slotsFull && !cooling && !noCoins && (a.Password != "" || a.AccessToken != "" || a.HasAPIKey)
 }
 
 func parseCoins(s string) int {
@@ -491,20 +510,37 @@ func parseCoins(s string) int {
 
 func (s *Store) LeaseAccount(id int64, taskID string, ttl time.Duration) error {
 	until := time.Now().UTC().Add(ttl).Format(time.RFC3339)
-	res, err := s.db.Exec(`UPDATE accounts SET lease_task_id=?, lease_until=?, current_task_counts='1', updated_at=? WHERE id=? AND (lease_task_id='' OR lease_until < ?)`,
-		taskID, until, now(), id, now())
+	ts := now()
+	res, err := s.db.Exec(`
+UPDATE accounts SET
+  inflight = inflight + 1,
+  lease_task_id = ?,
+  lease_until = ?,
+  updated_at = ?
+WHERE id = ?
+  AND inflight < CASE WHEN max_concurrency < 1 THEN 1 ELSE max_concurrency END
+`, taskID, until, ts, id)
 	if err != nil {
 		return err
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("account %d already leased", id)
+		return fmt.Errorf("account %d already at concurrency limit", id)
 	}
 	return nil
 }
 
 func (s *Store) ReleaseAccountOK(id int64) error {
-	_, err := s.db.Exec(`UPDATE accounts SET lease_task_id='', lease_until='', current_task_counts='0', fail_count=0, last_error='', cooldown_until='', updated_at=? WHERE id=?`, now(), id)
+	_, err := s.db.Exec(`
+UPDATE accounts SET
+  inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END,
+  lease_task_id = CASE WHEN inflight <= 1 THEN '' ELSE lease_task_id END,
+  lease_until = CASE WHEN inflight <= 1 THEN '' ELSE lease_until END,
+  fail_count = 0,
+  last_error = '',
+  cooldown_until = '',
+  updated_at = ?
+WHERE id = ?`, now(), id)
 	return err
 }
 
@@ -513,13 +549,37 @@ func (s *Store) ReleaseAccountFail(id int64, code, msg string, cooldown time.Dur
 	if cooldown > 0 {
 		until = time.Now().UTC().Add(cooldown).Format(time.RFC3339)
 	}
-	counts := "0"
-	if code == "BUSY" {
-		counts = "1"
-	}
-	_, err := s.db.Exec(`UPDATE accounts SET lease_task_id='', lease_until='', current_task_counts=?, fail_count=fail_count+1, last_error=?, cooldown_until=?, updated_at=? WHERE id=?`,
-		counts, truncate(code+": "+msg, 500), until, now(), id)
+	_, err := s.db.Exec(`
+UPDATE accounts SET
+  inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END,
+  lease_task_id = CASE WHEN inflight <= 1 THEN '' ELSE lease_task_id END,
+  lease_until = CASE WHEN inflight <= 1 THEN '' ELSE lease_until END,
+  fail_count = fail_count + 1,
+  last_error = ?,
+  cooldown_until = ?,
+  updated_at = ?
+WHERE id = ?`,
+		truncate(code+": "+msg, 500), until, now(), id)
 	return err
+}
+
+// SetAccountMaxConcurrency sets per-account gateway concurrency (1..64).
+func (s *Store) SetAccountMaxConcurrency(id int64, maxConcurrency int) error {
+	if maxConcurrency < 1 {
+		maxConcurrency = 1
+	}
+	if maxConcurrency > 64 {
+		maxConcurrency = 64
+	}
+	res, err := s.db.Exec(`UPDATE accounts SET max_concurrency=?, updated_at=? WHERE id=?`, maxConcurrency, now(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) DisableAccount(id int64, reason string) error {
@@ -740,10 +800,13 @@ func (s *Store) scanAccount(row rowScanner) (Account, error) {
 	err := row.Scan(
 		&a.ID, &a.Email, &a.Password, &a.AccessToken, &a.RefreshToken, &a.APIKey, &a.Identify, &a.RHUserID,
 		&a.RemainCoins, &a.CurrentTaskCounts, &a.APIType, &a.LastBalanceAt, &a.LastLoginCoinAt,
-		&a.AnonymousID, &a.DeviceID, &a.FingerprintJSON, &a.EgressID,
+		&a.AnonymousID, &a.DeviceID, &a.FingerprintJSON, &a.EgressID, &a.MaxConcurrency, &a.Inflight,
 		&a.Status, &a.Source, &a.ExternalID, &a.CooldownUntil, &a.FailCount, &a.LastError,
 		&a.LeaseTaskID, &a.LeaseUntil, &a.CreatedAt, &a.UpdatedAt,
 	)
+	if err == nil && a.MaxConcurrency < 1 {
+		a.MaxConcurrency = 1
+	}
 	return a, err
 }
 

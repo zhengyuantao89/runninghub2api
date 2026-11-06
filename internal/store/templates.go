@@ -22,19 +22,21 @@ func randomHex(n int) (string, error) {
 }
 
 type WebappTemplate struct {
-	ID           string          `json:"id"`
-	WebappID     string          `json:"webapp_id"`
-	Name         string          `json:"name"`
-	Description  string          `json:"description,omitempty"`
-	Source       string          `json:"source,omitempty"`
-	NodeInfoJSON string          `json:"-"`
-	ExampleJSON  string          `json:"-"`
-	NodeInfoList json.RawMessage `json:"node_info_list"`
-	Example      json.RawMessage `json:"example,omitempty"`
-	Note         string          `json:"note,omitempty"`
-	NodeCount    int             `json:"node_count"`
-	CreatedAt    string          `json:"created_at"`
-	UpdatedAt    string          `json:"updated_at"`
+	ID              string          `json:"id"`
+	WebappID        string          `json:"webapp_id"`
+	Name            string          `json:"name"`
+	Description     string          `json:"description,omitempty"`
+	Source          string          `json:"source,omitempty"`
+	AccessPassword  string          `json:"access_password,omitempty"` // RH 加密访问应用密码；提交时网关自动注入
+	HasAccessPass   bool            `json:"has_access_password"`
+	NodeInfoJSON    string          `json:"-"`
+	ExampleJSON     string          `json:"-"`
+	NodeInfoList    json.RawMessage `json:"node_info_list"`
+	Example         json.RawMessage `json:"example,omitempty"`
+	Note            string          `json:"note,omitempty"`
+	NodeCount       int             `json:"node_count"`
+	CreatedAt       string          `json:"created_at"`
+	UpdatedAt       string          `json:"updated_at"`
 }
 
 var (
@@ -42,9 +44,10 @@ var (
 	ErrInvalidExample  = errors.New("invalid example_json")
 )
 
-const templateSelect = `SELECT id, webapp_id, name, description, source, node_info_json, example_json, note, created_at, updated_at FROM webapp_templates`
+const templateSelect = `SELECT id, webapp_id, name, description, source, access_password, node_info_json, example_json, note, created_at, updated_at FROM webapp_templates`
 
 func (t *WebappTemplate) hydrateJSON() {
+	t.HasAccessPass = strings.TrimSpace(t.AccessPassword) != ""
 	if strings.TrimSpace(t.NodeInfoJSON) == "" {
 		t.NodeInfoList = json.RawMessage("[]")
 		t.NodeCount = 0
@@ -58,6 +61,12 @@ func (t *WebappTemplate) hydrateJSON() {
 	if strings.TrimSpace(t.ExampleJSON) != "" {
 		t.Example = json.RawMessage(t.ExampleJSON)
 	}
+}
+
+// PublicListView hides plaintext access password in list responses.
+func (t *WebappTemplate) PublicListView() {
+	t.hydrateJSON()
+	t.AccessPassword = ""
 }
 
 func validateNodeInfoJSON(raw string) (string, error) {
@@ -95,6 +104,7 @@ func (s *Store) UpsertWebappTemplate(t WebappTemplate) (WebappTemplate, error) {
 	t.Note = strings.TrimSpace(t.Note)
 	t.Source = strings.TrimSpace(t.Source)
 	t.Description = strings.TrimSpace(t.Description)
+	t.AccessPassword = strings.TrimSpace(t.AccessPassword)
 	ts := now()
 
 	existing, getErr := s.GetWebappTemplateByWebappID(t.WebappID)
@@ -116,6 +126,9 @@ func (s *Store) UpsertWebappTemplate(t WebappTemplate) (WebappTemplate, error) {
 		if t.Note == "" {
 			t.Note = existing.Note
 		}
+		if t.AccessPassword == "" {
+			t.AccessPassword = existing.AccessPassword
+		}
 	case errors.Is(getErr, ErrNotFound):
 		if strings.TrimSpace(t.ID) == "" {
 			hexID, genErr := randomHex(10)
@@ -132,17 +145,18 @@ func (s *Store) UpsertWebappTemplate(t WebappTemplate) (WebappTemplate, error) {
 	}
 
 	_, err = s.db.Exec(`
-INSERT INTO webapp_templates(id, webapp_id, name, description, source, node_info_json, example_json, note, created_at, updated_at)
-VALUES(?,?,?,?,?,?,?,?,?,?)
+INSERT INTO webapp_templates(id, webapp_id, name, description, source, access_password, node_info_json, example_json, note, created_at, updated_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(webapp_id) DO UPDATE SET
   name=CASE WHEN excluded.name='' THEN webapp_templates.name ELSE excluded.name END,
   description=CASE WHEN excluded.description='' THEN webapp_templates.description ELSE excluded.description END,
   source=CASE WHEN excluded.source='' THEN webapp_templates.source ELSE excluded.source END,
+  access_password=CASE WHEN excluded.access_password='' THEN webapp_templates.access_password ELSE excluded.access_password END,
   node_info_json=excluded.node_info_json,
   example_json=CASE WHEN excluded.example_json='' THEN webapp_templates.example_json ELSE excluded.example_json END,
   note=CASE WHEN excluded.note='' THEN webapp_templates.note ELSE excluded.note END,
   updated_at=excluded.updated_at
-`, t.ID, t.WebappID, t.Name, t.Description, t.Source, t.NodeInfoJSON, t.ExampleJSON, t.Note, ts, ts)
+`, t.ID, t.WebappID, t.Name, t.Description, t.Source, t.AccessPassword, t.NodeInfoJSON, t.ExampleJSON, t.Note, ts, ts)
 	if err != nil {
 		return WebappTemplate{}, err
 	}
@@ -177,9 +191,19 @@ func (s *Store) ListWebappTemplates() ([]WebappTemplate, error) {
 		if err != nil {
 			return nil, err
 		}
+		t.PublicListView()
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// GetWebappAccessPassword returns saved access password for a webapp (empty if none).
+func (s *Store) GetWebappAccessPassword(webappID string) string {
+	t, err := s.GetWebappTemplateByWebappID(webappID)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(t.AccessPassword)
 }
 
 func (s *Store) DeleteWebappTemplate(id string) error {
@@ -197,7 +221,7 @@ func (s *Store) DeleteWebappTemplate(id string) error {
 func (s *Store) scanTemplate(row rowScanner) (WebappTemplate, error) {
 	var t WebappTemplate
 	err := row.Scan(
-		&t.ID, &t.WebappID, &t.Name, &t.Description, &t.Source,
+		&t.ID, &t.WebappID, &t.Name, &t.Description, &t.Source, &t.AccessPassword,
 		&t.NodeInfoJSON, &t.ExampleJSON, &t.Note, &t.CreatedAt, &t.UpdatedAt,
 	)
 	if err != nil {

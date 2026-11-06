@@ -11,6 +11,7 @@ import { isListNode, isNumberNode, optionsSummary } from '@/lib/webappNodes'
 const router = useRouter()
 
 const webappId = ref('')
+const accessPassword = ref('')
 const loading = ref(false)
 const saving = ref(false)
 const error = ref('')
@@ -32,8 +33,15 @@ const gatewayCurl = computed(() => {
 
 const submitExample = computed(() => {
   if (!demo.value?.example?.body) return ''
+  // 下游示例不带 access_password：模板保存后由网关自动注入
   return JSON.stringify(demo.value.example.body, null, 2)
 })
+
+const needsAccessPassword = computed(
+  () =>
+    !!(demo.value?.access_encrypted || demo.value?.has_access_password) ||
+    !!String(accessPassword.value || '').trim(),
+)
 
 const alreadySaved = computed(() => {
   const id = demo.value?.webapp_id
@@ -107,18 +115,26 @@ async function saveTemplate() {
   saveMsg.value = ''
   saving.value = true
   try {
+    const pwd = String(accessPassword.value || '').trim()
+    if (demo.value.access_encrypted && !pwd && !alreadySaved.value?.has_access_password) {
+      throw new Error('该应用开启了加密访问，请填写访问密码后再保存')
+    }
     const saved = await api.saveTemplate({
       webapp_id: demo.value.webapp_id,
       name: demo.value.name || demo.value.webapp_id,
       description: demo.value.description || '',
       source: demo.value.source || '',
+      access_password: pwd,
       node_info_list: demo.value.node_info_list || [],
       example: demo.value.example || null,
     })
     saveMsg.value = alreadySaved.value ? '已更新保存' : '已保存到模板库'
     await loadSaved()
-    // keep message accurate after reload
-    if (saved?.id) saveMsg.value = '已保存，可在试跑工作室选择'
+    if (saved?.id) {
+      saveMsg.value = pwd
+        ? '已保存（含访问密码，下游提交无需再传）'
+        : '已保存，可在试跑工作室选择'
+    }
   } catch (e) {
     error.value = e.message || String(e)
   } finally {
@@ -150,6 +166,7 @@ async function loadSavedIntoDemo(t) {
   webappId.value = t.webapp_id
   try {
     const full = await api.getTemplate(t.id)
+    accessPassword.value = full.access_password || ''
     demo.value = {
       webapp_id: full.webapp_id,
       name: full.name,
@@ -157,6 +174,8 @@ async function loadSavedIntoDemo(t) {
       source: full.source,
       node_info_list: full.node_info_list || [],
       example: full.example || null,
+      has_access_password: !!full.has_access_password || !!full.access_password,
+      cached: true,
     }
   } catch (e) {
     error.value = e.message || String(e)
@@ -207,7 +226,7 @@ onMounted(loadSaved)
             size="md"
             block
             root-class="webapps-query__input"
-            placeholder="从 RH 应用页 URL 复制，例如 2099427470494662657"
+            placeholder="从 RH 应用页 URL 复制，例如 2054244556132102145"
             @keydown.enter.prevent="fetchDemo"
           />
           <Button
@@ -220,6 +239,21 @@ onMounted(loadSaved)
             {{ loading ? '拉取中…' : '拉取模板' }}
           </Button>
         </div>
+        <label class="webapps-query__label" for="access-password-input">访问密码（加密应用）</label>
+        <div class="webapps-query__row">
+          <Input
+            id="access-password-input"
+            v-model="accessPassword"
+            type="text"
+            size="md"
+            block
+            root-class="webapps-query__input"
+            placeholder="如 asdfghjkl；保存到模板后下游提交无需再传"
+          />
+        </div>
+        <p class="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
+          部分应用需访问密码才能运行。拉取后在此填写并「保存到模板」，网关提交时会自动带上。
+        </p>
         <p v-if="error" class="webapps-query__error">{{ error }}</p>
         <p v-else-if="saveMsg" class="webapps-query__ok">{{ saveMsg }}</p>
       </section>
@@ -249,6 +283,7 @@ onMounted(loadSaved)
               <th class="px-3 py-2.5 font-medium">名称</th>
               <th class="px-3 py-2.5 font-medium">webappId</th>
               <th class="px-3 py-2.5 font-medium">节点</th>
+              <th class="px-3 py-2.5 font-medium">密码</th>
               <th class="px-3 py-2.5 font-medium">来源</th>
               <th class="px-3 py-2.5 font-medium">操作</th>
             </tr>
@@ -266,6 +301,12 @@ onMounted(loadSaved)
               <td class="px-3 py-2.5">{{ t.node_count ?? '—' }}</td>
               <td class="px-3 py-2.5">
                 <TonePill
+                  :tone="t.has_access_password ? 'success' : 'neutral'"
+                  :label="t.has_access_password ? '已存' : '无'"
+                />
+              </td>
+              <td class="px-3 py-2.5">
+                <TonePill
                   v-if="t.source"
                   :tone="t.source === 'apiCallDemo' ? 'success' : 'neutral'"
                   :label="t.source"
@@ -281,7 +322,7 @@ onMounted(loadSaved)
               </td>
             </tr>
             <tr v-if="!savedTemplates.length">
-              <td colspan="5" class="px-3 py-8 text-center text-muted-foreground">
+              <td colspan="6" class="px-3 py-8 text-center text-muted-foreground">
                 暂无保存的模板，拉取后点「保存到模板库」
               </td>
             </tr>
@@ -293,7 +334,14 @@ onMounted(loadSaved)
     <PagePanel v-if="demo" class="space-y-4">
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div class="min-w-0">
-          <h3 class="text-sm font-semibold text-foreground">{{ demo.name || '未命名应用' }}</h3>
+          <div class="flex flex-wrap items-center gap-2">
+            <h3 class="text-sm font-semibold text-foreground">{{ demo.name || '未命名应用' }}</h3>
+            <TonePill
+              v-if="needsAccessPassword"
+              :tone="accessPassword || demo.has_access_password ? 'success' : 'error'"
+              :label="accessPassword || demo.has_access_password ? '加密·已设密码' : '加密·需访问密码'"
+            />
+          </div>
           <p class="mt-1 break-all font-mono text-xs text-muted-foreground">{{ demo.webapp_id }}</p>
           <p v-if="demo.rh_key_account" class="mt-1 text-xs text-muted-foreground">
             使用号池 Key：{{ demo.rh_key_account }}
@@ -383,7 +431,7 @@ onMounted(loadSaved)
 
       <section v-if="submitExample" class="webapps-code">
         <div class="webapps-code__bar">
-          <p class="webapps-code__title">下游提交 body（POST /v1/videos）</p>
+          <p class="webapps-code__title">下游提交 body（改本应用 node_info_list；加密应用密码已由模板注入）</p>
           <Button size="xs" variant="outline" @click="copy(submitExample, 'body2')">
             {{ copied === 'body2' ? '已复制' : '复制' }}
           </Button>
