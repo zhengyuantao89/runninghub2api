@@ -390,6 +390,73 @@ func (c *Client) OutputHistoryV2(body map[string]any) (map[string]any, error) {
 	return c.postJSON("/api/output/v2/history", body)
 }
 
+// OpenAPITaskStatus queries RH official task status with consumer apiKey.
+// POST /task/openapi/status → data is QUEUED|RUNNING|FAILED|SUCCESS.
+func (c *Client) OpenAPITaskStatus(apiKey, taskID string) (string, error) {
+	key := strings.TrimSpace(apiKey)
+	taskID = strings.TrimSpace(taskID)
+	if key == "" || taskID == "" {
+		return "", fmt.Errorf("apiKey and taskId required")
+	}
+	payload, err := json.Marshal(map[string]any{"apiKey": key, "taskId": taskID})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest(http.MethodPost, c.BaseURL+"/task/openapi/status", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header = c.headers(nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	res, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(res.Body)
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return "", fmt.Errorf("openapi/status non-json HTTP %d: %s", res.StatusCode, truncate(string(raw), 200))
+	}
+	if res.StatusCode >= 400 || asInt(decoded["code"]) != 0 {
+		return "", &APIError{Path: "/task/openapi/status", Status: res.StatusCode, Code: decoded["code"], Msg: asString(decoded["msg"]), Data: decoded["data"]}
+	}
+	return asString(decoded["data"]), nil
+}
+
+// OpenAPITaskOutputs queries RH official task outputs with consumer apiKey.
+func (c *Client) OpenAPITaskOutputs(apiKey, taskID string) (map[string]any, error) {
+	key := strings.TrimSpace(apiKey)
+	taskID = strings.TrimSpace(taskID)
+	if key == "" || taskID == "" {
+		return nil, fmt.Errorf("apiKey and taskId required")
+	}
+	payload, err := json.Marshal(map[string]any{"apiKey": key, "taskId": taskID})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, c.BaseURL+"/task/openapi/outputs", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header = c.headers(nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	res, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(res.Body)
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil, fmt.Errorf("openapi/outputs non-json HTTP %d: %s", res.StatusCode, truncate(string(raw), 200))
+	}
+	if res.StatusCode >= 400 || asInt(decoded["code"]) != 0 {
+		return nil, &APIError{Path: "/task/openapi/outputs", Status: res.StatusCode, Code: decoded["code"], Msg: asString(decoded["msg"]), Data: decoded["data"]}
+	}
+	return decoded, nil
+}
+
 // AccountStatus uses consumer apiKey (Bearer + body.apikey) to query remainCoins / currentTaskCounts.
 func (c *Client) AccountStatus(apiKey string) (map[string]any, error) {
 	key := strings.TrimSpace(apiKey)

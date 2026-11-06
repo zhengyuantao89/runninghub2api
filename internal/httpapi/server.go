@@ -72,6 +72,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/logout", s.withSession(s.handleLogout))
 	s.mux.HandleFunc("/api/me", s.withSession(s.handleMe))
 	s.mux.HandleFunc("/api/console", s.withSession(s.handleConsole))
+	s.mux.HandleFunc("/admin/settings", s.withSessionOrAPIKey(s.handleAdminSettings))
 
 	// Browser session OR external API key.
 	s.mux.HandleFunc("/v1/videos", s.withSessionOrAPIKey(s.handleVideos))
@@ -240,10 +241,44 @@ func (s *Server) handleConsole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"username": s.cfg.AdminUser,
-		"api_key":  s.cfg.APIKey,
-		"hint":     "下游调用与账号推送请使用此 API Key；控制台登录后工作室无需再填 Key。",
+		"username":  s.cfg.AdminUser,
+		"api_key":   s.cfg.APIKey,
+		"poll_auth": s.resolvePollAuth(),
+		"hint":      "下游调用与账号推送请使用此 API Key；控制台登录后工作室无需再填 Key。",
 	})
+}
+
+func (s *Server) resolvePollAuth() string {
+	if v, err := s.store.GetSetting(store.SettingPollAuth); err == nil && strings.TrimSpace(v) != "" {
+		return config.NormalizePollAuth(v)
+	}
+	return config.NormalizePollAuth(s.cfg.PollAuth)
+}
+
+func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"poll_auth":         s.resolvePollAuth(),
+			"poll_auth_default": config.NormalizePollAuth(s.cfg.PollAuth),
+		})
+	case http.MethodPut, http.MethodPost:
+		var body struct {
+			PollAuth string `json:"poll_auth"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+			return
+		}
+		mode := config.NormalizePollAuth(body.PollAuth)
+		if err := s.store.SetSetting(store.SettingPollAuth, mode); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "poll_auth": mode})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }
 
 func (s *Server) handleVideos(w http.ResponseWriter, r *http.Request) {
@@ -313,6 +348,7 @@ func (s *Server) handleWebappByID(w http.ResponseWriter, r *http.Request) {
 func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 	prompt := ""
 	webappID := s.cfg.WebappID
+	templateID := ""
 	duration := "8"
 	aspect := "3:4 (Portrait Standard)"
 	accessPassword := ""
@@ -329,6 +365,9 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 		prompt = strings.TrimSpace(r.FormValue("prompt"))
 		if v := r.FormValue("webapp_id"); v != "" {
 			webappID = v
+		}
+		if v := strings.TrimSpace(r.FormValue("template_id")); v != "" {
+			templateID = v
 		}
 		if v := r.FormValue("duration"); v != "" {
 			duration = v
@@ -388,6 +427,7 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 			ImageBase64    string                 `json:"image_base64"`
 			ImagesBase64   map[string]string      `json:"images_base64"`
 			WebappID       string                 `json:"webapp_id"`
+			TemplateID     string                 `json:"template_id"`
 			Duration       string                 `json:"duration"`
 			AspectRatio    string                 `json:"aspect_ratio"`
 			AccessPassword string                 `json:"access_password"`
@@ -401,6 +441,9 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 		nodeInfoList = body.NodeInfoList
 		if body.WebappID != "" {
 			webappID = body.WebappID
+		}
+		if strings.TrimSpace(body.TemplateID) != "" {
+			templateID = strings.TrimSpace(body.TemplateID)
 		}
 		if body.Duration != "" {
 			duration = body.Duration
@@ -472,6 +515,13 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 	id := "vid_" + randomID(12)
 	ts := time.Now().UTC().Format(time.RFC3339)
 
+	// 未显式传 template_id 时，按 webapp_id 反查已保存模板
+	if templateID == "" && strings.TrimSpace(webappID) != "" {
+		if tpl, err := s.store.GetWebappTemplateByWebappID(webappID); err == nil {
+			templateID = tpl.ID
+		}
+	}
+
 	// 先占号再落库，避免 queued 窗口被 worker 重复领取
 	acc, acquireErr := s.pool.Acquire(id)
 	status := "queued"
@@ -484,7 +534,7 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 
 	task := store.VideoTask{
 		ID: id, Status: status, Prompt: prompt, ImagePath: imagePath,
-		WebappID: webappID, Duration: duration, AspectRatio: aspect,
+		WebappID: webappID, TemplateID: templateID, Duration: duration, AspectRatio: aspect,
 		NodeInfoJSON: nodeInfoJSON,
 		CreatedAt:    ts, UpdatedAt: ts,
 	}
@@ -504,8 +554,8 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 	if acquireErr != nil {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id": id, "status": "queued", "rh_task_id": "",
-			"webapp_id": webappID,
-			"message":   "queued: no available account yet; poll GET /v1/videos/{id} for rh_task_id",
+			"webapp_id": webappID, "template_id": templateID,
+			"message": "queued: no available account yet; poll GET /v1/videos/{id} for rh_task_id",
 		})
 		return
 	}
@@ -611,6 +661,7 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 		"status":        "running",
 		"rh_task_id":    sess.TaskID,
 		"webapp_id":     webappID,
+		"template_id":   templateID,
 		"account_id":    acc.ID,
 		"account_email": acc.Email,
 	})

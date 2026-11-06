@@ -16,11 +16,23 @@ type Config struct {
 	BaseURL       string
 	WebappID      string
 	Workers       int
+	// PollAuth: "apikey" (RH openapi status/outputs) or "at" (Bearer access_token task/list).
+	PollAuth string
 
 	// Legacy aliases kept so old .env / gpt-plus tokens still work until rotated.
 	AuthKey   string
 	AdminKey  string
 	SyncToken string
+}
+
+// NormalizePollAuth returns "apikey" or "at".
+func NormalizePollAuth(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "at", "access_token", "token":
+		return "at"
+	default:
+		return "apikey"
+	}
 }
 
 func Load() Config {
@@ -58,6 +70,7 @@ func Load() Config {
 		BaseURL:       strings.TrimRight(env("RH2API_BASE_URL", "https://www.runninghub.ai"), "/"),
 		WebappID:      env("RH2API_WEBAPP_ID", "2099427470494662657"),
 		Workers:       workers,
+		PollAuth:      NormalizePollAuth(env("RH2API_POLL_AUTH", "apikey")),
 		AuthKey:       authKey,
 		AdminKey:      adminKey,
 		SyncToken:     syncToken,

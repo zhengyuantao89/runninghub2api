@@ -564,6 +564,112 @@ type TaskSnapshot struct {
 	FailMsg      string
 }
 
+// LookupTaskSnapshotByAPIKey uses official openapi status + outputs (Bearer apiKey).
+func LookupTaskSnapshotByAPIKey(client *Client, apiKey, taskID string) (TaskSnapshot, error) {
+	var snap TaskSnapshot
+	if client == nil || strings.TrimSpace(apiKey) == "" || strings.TrimSpace(taskID) == "" {
+		return snap, fmt.Errorf("client, apiKey and taskId required")
+	}
+	status, err := client.OpenAPITaskStatus(apiKey, taskID)
+	if err != nil {
+		return snap, err
+	}
+	status = strings.TrimSpace(status)
+	snap.RHStatus = status
+	upper := strings.ToUpper(status)
+	switch {
+	case strings.EqualFold(status, "QUEUED"):
+		snap.ProgressText = "排队中"
+	case strings.EqualFold(status, "RUNNING"):
+		snap.ProgressText = "生成中"
+	case strings.EqualFold(status, "SUCCESS"):
+		snap.ProgressText = "完成"
+	default:
+		snap.ProgressText = status
+	}
+	if strings.Contains(upper, "FAIL") || strings.Contains(upper, "ERROR") || strings.Contains(upper, "CANCEL") {
+		snap.Failed = true
+		snap.FailMsg = firstNonEmpty(status, "FAILED")
+		return snap, nil
+	}
+	if !strings.EqualFold(status, "SUCCESS") {
+		return snap, nil
+	}
+
+	out, err := client.OpenAPITaskOutputs(apiKey, taskID)
+	if err != nil {
+		return snap, err
+	}
+	items, _ := out["data"].([]any)
+	for _, it := range items {
+		item, _ := it.(map[string]any)
+		if item == nil {
+			continue
+		}
+		fileURL := asString(item["fileUrl"])
+		if fileURL == "" {
+			continue
+		}
+		snap.FileURL = fileURL
+		snap.PreviewURL = firstNonEmpty(asString(item["filePreviewUrl"]), fileURL)
+		snap.Done = true
+		snap.RHStatus = "SUCCESS"
+		snap.ProgressText = "完成"
+		return snap, nil
+	}
+	// SUCCESS but outputs not ready yet — keep polling.
+	snap.RHStatus = "RUNNING"
+	snap.ProgressText = "生成中"
+	return snap, nil
+}
+
+// PollByAPIKey waits for SUCCESS outputs (or failure/timeout) via openapi.
+func PollByAPIKey(client *Client, apiKey, taskID string, in RunInput) (*RunResult, error) {
+	if client == nil || strings.TrimSpace(apiKey) == "" || strings.TrimSpace(taskID) == "" {
+		return nil, fmt.Errorf("client, apiKey and taskId required")
+	}
+	pollEvery := in.PollEvery
+	if pollEvery <= 0 {
+		pollEvery = 5 * time.Second
+	}
+	timeout := in.Timeout
+	if timeout <= 0 {
+		timeout = 15 * time.Minute
+	}
+	deadline := time.Now().Add(timeout)
+	webappID := firstNonEmpty(in.WebappID, DefaultWebappID)
+
+	for time.Now().Before(deadline) {
+		snap, err := LookupTaskSnapshotByAPIKey(client, apiKey, taskID)
+		if err != nil {
+			return nil, err
+		}
+		if in.OnProgress != nil {
+			in.OnProgress(Progress{
+				TaskID:       taskID,
+				RHStatus:     snap.RHStatus,
+				ProgressText: snap.ProgressText,
+				QueueIndex:   snap.QueueIndex,
+				QueueCount:   snap.QueueCount,
+			})
+		}
+		if snap.Failed {
+			return nil, fmt.Errorf("task failed: %s", firstNonEmpty(snap.FailMsg, snap.RHStatus))
+		}
+		if snap.Done {
+			return &RunResult{
+				TaskID:     taskID,
+				FileURL:    snap.FileURL,
+				PreviewURL: snap.PreviewURL,
+				Status:     "SUCCESS",
+				WebappID:   webappID,
+			}, nil
+		}
+		time.Sleep(pollEvery)
+	}
+	return nil, fmt.Errorf("timeout waiting fileUrl for task %s", taskID)
+}
+
 // LookupTaskSnapshot checks task list + output history once.
 func LookupTaskSnapshot(client *Client, webappID, taskID string) (TaskSnapshot, error) {
 	var snap TaskSnapshot

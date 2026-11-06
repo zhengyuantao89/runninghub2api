@@ -33,6 +33,7 @@ const detailFields = computed(() => {
     { label: '进度', value: progressLabel(t) },
     { label: '排队', value: t.queue_count ? `${t.queue_index}/${t.queue_count}` : '—' },
     { label: 'Webapp', value: t.webapp_id || '—', mono: true },
+    { label: '模板 ID', value: t.template_id || '—', mono: true, copy: !!t.template_id },
     { label: '时长', value: t.duration || '—' },
     { label: '画幅', value: t.aspect_ratio || '—' },
     { label: '尝试次数', value: t.attempts ?? 0 },
@@ -145,6 +146,7 @@ onUnmounted(() => clearInterval(timer))
             <tr>
               <th class="py-3 pr-5">本地 ID</th>
               <th class="py-3 pr-5">账号</th>
+              <th class="py-3 pr-5">模板</th>
               <th class="py-3 pr-5">RH Task</th>
               <th class="py-3 pr-5">状态</th>
               <th class="py-3 pr-5">进度</th>
@@ -159,6 +161,15 @@ onUnmounted(() => clearInterval(timer))
                 <button type="button" class="font-mono text-xs hover:underline" @click="copy(t.id)">{{ t.id }}</button>
               </td>
               <td class="py-3 pr-5">{{ t.account_email || '—' }}</td>
+              <td class="py-3 pr-5">
+                <button
+                  v-if="t.template_id"
+                  type="button"
+                  class="font-mono text-xs text-muted-foreground hover:underline"
+                  @click="copy(t.template_id)"
+                >{{ t.template_id }}</button>
+                <span v-else class="text-muted-foreground">—</span>
+              </td>
               <td class="py-3 pr-5">
                 <button
                   v-if="t.rh_task_id"
@@ -216,7 +227,7 @@ onUnmounted(() => clearInterval(timer))
               </td>
             </tr>
             <tr v-if="!rows.length">
-              <td colspan="8" class="py-8 text-center text-sm text-muted-foreground">暂无任务</td>
+              <td colspan="9" class="py-8 text-center text-sm text-muted-foreground">暂无任务</td>
             </tr>
           </tbody>
         </table>

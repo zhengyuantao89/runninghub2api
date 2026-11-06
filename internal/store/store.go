@@ -71,6 +71,7 @@ type VideoTask struct {
 	Prompt       string `json:"prompt"`
 	ImagePath    string `json:"image_path,omitempty"`
 	WebappID     string `json:"webapp_id"`
+	TemplateID   string `json:"template_id,omitempty"`
 	Duration     string `json:"duration,omitempty"`
 	AspectRatio  string `json:"aspect_ratio,omitempty"`
 	NodeInfoJSON string `json:"node_info_json,omitempty"`
@@ -158,6 +159,11 @@ CREATE TABLE IF NOT EXISTS video_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_video_tasks_status ON video_tasks(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status, cooldown_until);
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 `)
 	if err != nil {
 		return err
@@ -236,6 +242,7 @@ CREATE TABLE IF NOT EXISTS egress_subscriptions (
 		{"queue_count", "queue_count INTEGER NOT NULL DEFAULT 0"},
 		{"progress_text", "progress_text TEXT NOT NULL DEFAULT ''"},
 		{"node_info_json", "node_info_json TEXT NOT NULL DEFAULT ''"},
+		{"template_id", "template_id TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := s.addColumnIfMissing("video_tasks", col.name, col.ddl); err != nil {
 			return err
@@ -311,7 +318,7 @@ func now() string { return time.Now().UTC().Format(time.RFC3339) }
 
 const accountSelect = `SELECT id,email,password,access_token,refresh_token,api_key,identify,rh_user_id,remain_coins,current_task_counts,api_type,last_balance_at,last_login_coin_at,anonymous_id,device_id,fingerprint_json,egress_id,max_concurrency,inflight,status,source,external_id,cooldown_until,fail_count,last_error,lease_task_id,lease_until,created_at,updated_at FROM accounts`
 
-const taskSelect = `SELECT id,status,prompt,image_path,webapp_id,duration,aspect_ratio,node_info_json,account_id,account_email,rh_task_id,rh_status,queue_index,queue_count,progress_text,file_url,preview_url,error_code,error,attempts,created_at,updated_at,finished_at FROM video_tasks`
+const taskSelect = `SELECT id,status,prompt,image_path,webapp_id,template_id,duration,aspect_ratio,node_info_json,account_id,account_email,rh_task_id,rh_status,queue_index,queue_count,progress_text,file_url,preview_url,error_code,error,attempts,created_at,updated_at,finished_at FROM video_tasks`
 
 func (s *Store) UpsertAccount(a Account) (Account, error) {
 	a.Email = strings.TrimSpace(strings.ToLower(a.Email))
@@ -682,8 +689,8 @@ func (s *Store) UpdateAccountRHUserID(id int64, userID string) error {
 }
 
 func (s *Store) CreateTask(t VideoTask) error {
-	_, err := s.db.Exec(`INSERT INTO video_tasks(id,status,prompt,image_path,webapp_id,duration,aspect_ratio,node_info_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		t.ID, t.Status, t.Prompt, t.ImagePath, t.WebappID, t.Duration, t.AspectRatio, t.NodeInfoJSON, t.CreatedAt, t.UpdatedAt)
+	_, err := s.db.Exec(`INSERT INTO video_tasks(id,status,prompt,image_path,webapp_id,template_id,duration,aspect_ratio,node_info_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		t.ID, t.Status, t.Prompt, t.ImagePath, t.WebappID, t.TemplateID, t.Duration, t.AspectRatio, t.NodeInfoJSON, t.CreatedAt, t.UpdatedAt)
 	return err
 }
 
@@ -822,12 +829,36 @@ func (s *Store) scanAccountRows(rows *sql.Rows) (Account, error) {
 
 func (s *Store) scanTask(row rowScanner) (VideoTask, error) {
 	var t VideoTask
-	err := row.Scan(&t.ID, &t.Status, &t.Prompt, &t.ImagePath, &t.WebappID, &t.Duration, &t.AspectRatio, &t.NodeInfoJSON, &t.AccountID, &t.AccountEmail, &t.RHTaskID, &t.RHStatus, &t.QueueIndex, &t.QueueCount, &t.ProgressText, &t.FileURL, &t.PreviewURL, &t.ErrorCode, &t.Error, &t.Attempts, &t.CreatedAt, &t.UpdatedAt, &t.FinishedAt)
+	err := row.Scan(&t.ID, &t.Status, &t.Prompt, &t.ImagePath, &t.WebappID, &t.TemplateID, &t.Duration, &t.AspectRatio, &t.NodeInfoJSON, &t.AccountID, &t.AccountEmail, &t.RHTaskID, &t.RHStatus, &t.QueueIndex, &t.QueueCount, &t.ProgressText, &t.FileURL, &t.PreviewURL, &t.ErrorCode, &t.Error, &t.Attempts, &t.CreatedAt, &t.UpdatedAt, &t.FinishedAt)
 	return t, err
 }
 
 func (s *Store) scanTaskRows(rows *sql.Rows) (VideoTask, error) {
 	return s.scanTask(rows)
+}
+
+const SettingPollAuth = "poll_auth"
+
+func (s *Store) GetSetting(key string) (string, error) {
+	var value string
+	err := s.db.QueryRow(`SELECT value FROM app_settings WHERE key=?`, strings.TrimSpace(key)).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return value, err
+}
+
+func (s *Store) SetSetting(key, value string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return fmt.Errorf("setting key required")
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO app_settings(key,value,updated_at) VALUES(?,?,?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+		key, value, now(),
+	)
+	return err
 }
 
 func truncate(s string, n int) string {

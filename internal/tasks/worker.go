@@ -55,6 +55,14 @@ func (w *Worker) resumeOrphanRunning() {
 	}
 }
 
+// ResolvePollAuth returns runtime setting, falling back to env default.
+func (w *Worker) ResolvePollAuth() string {
+	if v, err := w.store.GetSetting(store.SettingPollAuth); err == nil && strings.TrimSpace(v) != "" {
+		return config.NormalizePollAuth(v)
+	}
+	return config.NormalizePollAuth(w.cfg.PollAuth)
+}
+
 // SyncAndMaybePoll queries RH once; if still in progress and continuePoll, keeps polling until done.
 func (w *Worker) SyncAndMaybePoll(taskID string, continuePoll bool) error {
 	task, err := w.store.GetTask(taskID)
@@ -68,10 +76,136 @@ func (w *Worker) SyncAndMaybePoll(taskID string, continuePoll bool) error {
 		return fmt.Errorf("no rh_task_id yet; wait for submit or requeue")
 	}
 	acc, err := w.store.GetAccount(task.AccountID)
-	if err != nil || (strings.TrimSpace(acc.Password) == "" && strings.TrimSpace(acc.AccessToken) == "") {
+	if err != nil {
 		return fmt.Errorf("account missing for task (id=%d)", task.AccountID)
 	}
+	hasATCreds := strings.TrimSpace(acc.Password) != "" || strings.TrimSpace(acc.AccessToken) != ""
+	hasAPIKey := strings.TrimSpace(acc.APIKey) != ""
+	if !hasATCreds && !hasAPIKey {
+		return fmt.Errorf("account missing credentials for task (id=%d)", task.AccountID)
+	}
 
+	mode := w.ResolvePollAuth()
+	if mode == "apikey" {
+		if err := w.syncAndMaybePollAPIKey(task, acc, continuePoll); err != nil {
+			if hasATCreds {
+				log.Printf("[task %s] apiKey poll failed, fallback to AT: %v", task.ID, err)
+				return w.syncAndMaybePollAT(task, acc, continuePoll)
+			}
+			return err
+		}
+		return nil
+	}
+	return w.syncAndMaybePollAT(task, acc, continuePoll)
+}
+
+func (w *Worker) ensureAccountAPIKey(acc store.Account) (string, store.Account, error) {
+	if key := strings.TrimSpace(acc.APIKey); key != "" {
+		return key, acc, nil
+	}
+	baseURL := w.cfg.BaseURL
+	if baseURL == "" {
+		baseURL = "https://www.runninghub.ai"
+	}
+	var gotKey string
+	err := w.egress.Do(acc, baseURL, func(client *runninghub.Client) error {
+		got, e := client.EnsureConsumerApiKey(acc.Email, acc.Password, acc.AccessToken)
+		if e != nil {
+			return e
+		}
+		gotKey = got.APIKey
+		_ = w.store.UpdateAccountAPIKey(acc.ID, got.APIKey)
+		_ = w.store.UpdateAccountAuthTokens(acc.ID, got.AccessToken, got.RefreshToken)
+		return nil
+	})
+	if err != nil {
+		return "", acc, err
+	}
+	acc.APIKey = gotKey
+	return gotKey, acc, nil
+}
+
+func (w *Worker) syncAndMaybePollAPIKey(task store.VideoTask, acc store.Account, continuePoll bool) error {
+	apiKey, acc, err := w.ensureAccountAPIKey(acc)
+	if err != nil {
+		return err
+	}
+	baseURL := w.cfg.BaseURL
+	if baseURL == "" {
+		baseURL = "https://www.runninghub.ai"
+	}
+	var snap runninghub.TaskSnapshot
+	err = w.egress.Do(acc, baseURL, func(client *runninghub.Client) error {
+		var e error
+		snap, e = runninghub.LookupTaskSnapshotByAPIKey(client, apiKey, task.RHTaskID)
+		return e
+	})
+	if err != nil && egress.IsConnectivityError(err) && acc.EgressID > 0 {
+		if n, e := w.store.GetEgress(acc.EgressID); e == nil {
+			_, _ = w.egress.Rebind(acc, w.cfg.BaseURL, &n, err.Error())
+			acc.EgressID = 0
+		}
+		err = w.egress.Do(acc, baseURL, func(client *runninghub.Client) error {
+			var e error
+			snap, e = runninghub.LookupTaskSnapshotByAPIKey(client, apiKey, task.RHTaskID)
+			return e
+		})
+	}
+	if err != nil {
+		return err
+	}
+	if snap.RHStatus != "" || snap.ProgressText != "" {
+		_ = w.store.UpdateTaskProgress(task.ID, snap.RHStatus, snap.ProgressText, snap.QueueIndex, snap.QueueCount)
+	}
+	if snap.Done {
+		_ = w.pool.ReleaseOK(acc.ID)
+		w.refreshAccountBalance(acc.ID)
+		return w.store.FinishTaskOK(task.ID, snap.FileURL, snap.PreviewURL)
+	}
+	if snap.Failed {
+		_ = w.pool.ReleaseFail(acc.ID, "RH", snap.FailMsg)
+		w.refreshAccountBalance(acc.ID)
+		return w.store.FinishTaskFail(task.ID, "RH", snap.FailMsg)
+	}
+	if !continuePoll {
+		return nil
+	}
+	webappID := first(task.WebappID, w.cfg.WebappID)
+	in := runninghub.RunInput{
+		WebappID: webappID,
+		BaseURL:  w.cfg.BaseURL,
+		OnProgress: func(p runninghub.Progress) {
+			_ = w.store.UpdateTaskProgress(task.ID, p.RHStatus, p.ProgressText, p.QueueIndex, p.QueueCount)
+		},
+	}
+	var result *runninghub.RunResult
+	var runErr error
+	err = w.egress.Do(acc, baseURL, func(client *runninghub.Client) error {
+		result, runErr = runninghub.PollByAPIKey(client, apiKey, task.RHTaskID, in)
+		return runErr
+	})
+	if err != nil {
+		low := strings.ToLower(err.Error())
+		if strings.Contains(low, "timeout") {
+			_ = w.store.UpdateTaskProgress(task.ID, first(snap.RHStatus, "RUNNING"), "轮询超时，可点「查询状态」", snap.QueueIndex, snap.QueueCount)
+			return err
+		}
+		if strings.Contains(low, "fail") || strings.Contains(low, "error") || strings.Contains(low, "cancel") {
+			_ = w.pool.ReleaseFail(acc.ID, "RH", err.Error())
+			w.refreshAccountBalance(acc.ID)
+			return w.store.FinishTaskFail(task.ID, "RH", err.Error())
+		}
+		return err
+	}
+	_ = w.pool.ReleaseOK(acc.ID)
+	w.refreshAccountBalance(acc.ID)
+	return w.store.FinishTaskOK(task.ID, result.FileURL, result.PreviewURL)
+}
+
+func (w *Worker) syncAndMaybePollAT(task store.VideoTask, acc store.Account, continuePoll bool) error {
+	if strings.TrimSpace(acc.Password) == "" && strings.TrimSpace(acc.AccessToken) == "" {
+		return fmt.Errorf("account missing AT credentials for task (id=%d)", acc.ID)
+	}
 	client, err := w.loginForTask(acc)
 	if err != nil {
 		return err

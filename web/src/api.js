@@ -72,6 +72,8 @@ export const api = {
   logout: () => request('/api/logout', { method: 'POST' }),
   me: () => request('/api/me'),
   console: () => request('/api/console'),
+  getSettings: () => request('/admin/settings'),
+  updateSettings: (body) => request('/admin/settings', { method: 'PUT', body }),
 
   listAccounts: () => request('/admin/accounts'),
   getAccount: (id) => request(`/admin/accounts/${id}`),

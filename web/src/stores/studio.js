@@ -285,6 +285,7 @@ async function submit() {
     })
     const fd = new FormData()
     fd.append('webapp_id', template.value.webapp_id)
+    if (template.value.id) fd.append('template_id', template.value.id)
     fd.append('node_info_list', JSON.stringify(list))
     for (const [nodeId, file] of Object.entries(imageFiles.value)) {
       if (file) fd.append(`image_${nodeId}`, file)

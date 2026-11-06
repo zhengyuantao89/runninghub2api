@@ -5,23 +5,43 @@ import PagePanel from '@/components/ai/PagePanel.vue'
 import { api } from '@/api'
 
 const loading = ref(false)
+const savingPoll = ref(false)
 const error = ref('')
+const okmsg = ref('')
 const username = ref('')
 const apiKey = ref('')
 const showKey = ref(false)
 const copied = ref(false)
+const pollAuth = ref('apikey')
 
 async function load() {
   error.value = ''
   loading.value = true
   try {
-    const res = await api.console()
-    username.value = res.username || 'admin'
-    apiKey.value = res.api_key || ''
+    const [consoleRes, settingsRes] = await Promise.all([api.console(), api.getSettings()])
+    username.value = consoleRes.username || 'admin'
+    apiKey.value = consoleRes.api_key || ''
+    pollAuth.value = settingsRes.poll_auth === 'at' ? 'at' : 'apikey'
   } catch (e) {
     error.value = e.message || String(e)
   } finally {
     loading.value = false
+  }
+}
+
+async function savePollAuth(next) {
+  const mode = next === 'at' ? 'at' : 'apikey'
+  error.value = ''
+  okmsg.value = ''
+  savingPoll.value = true
+  try {
+    const res = await api.updateSettings({ poll_auth: mode })
+    pollAuth.value = res.poll_auth === 'at' ? 'at' : 'apikey'
+    okmsg.value = pollAuth.value === 'apikey' ? '已切换为 API Key 轮询' : '已切换为 Access Token 轮询'
+  } catch (e) {
+    error.value = e.message || String(e)
+  } finally {
+    savingPoll.value = false
   }
 }
 
@@ -79,7 +99,42 @@ onMounted(load)
           </div>
         </div>
 
+        <div class="settings-field">
+          <div class="settings-field__label-row">
+            <span class="settings-label">任务进度轮询</span>
+            <span class="settings-hint">提交仍走账号 AT；仅查询进度可选通道</span>
+          </div>
+          <div class="settings-poll">
+            <button
+              type="button"
+              class="settings-poll__btn"
+              :class="{ active: pollAuth === 'apikey' }"
+              :disabled="savingPoll || loading"
+              @click="savePollAuth('apikey')"
+            >
+              API Key（推荐）
+            </button>
+            <button
+              type="button"
+              class="settings-poll__btn"
+              :class="{ active: pollAuth === 'at' }"
+              :disabled="savingPoll || loading"
+              @click="savePollAuth('at')"
+            >
+              Access Token
+            </button>
+          </div>
+          <p class="settings-poll__desc">
+            {{
+              pollAuth === 'apikey'
+                ? '使用账号 consumer API Key 调 /task/openapi/status 与 outputs；缺 Key 时会自动补，失败再回退 AT。'
+                : '沿用原逻辑：Bearer Access Token 查 /task/list 与 output history。'
+            }}
+          </p>
+        </div>
+
         <p v-if="error" class="settings-err">{{ error }}</p>
+        <p v-else-if="okmsg" class="settings-ok">{{ okmsg }}</p>
         <p v-else class="settings-ok">
           工作室提交任务不需要再填 Key：登录后直接用。外部同步账号时把这把 API Key 填到推送端即可。
         </p>
@@ -90,6 +145,7 @@ onMounted(load)
         <ul class="settings-tips">
           <li>控制台账号密码在服务器 <code>.env</code>：<code>RH2API_ADMIN_USER</code> / <code>RH2API_ADMIN_PASSWORD</code>。</li>
           <li>API Key 在服务器 <code>.env</code>：<code>RH2API_API_KEY</code>（兼容旧的 <code>RH2API_AUTH_KEY</code>）。</li>
+          <li>默认轮询方式可用 <code>RH2API_POLL_AUTH=apikey|at</code>；系统设置页可覆盖并即时生效。</li>
           <li>外部系统同步账号时，把 Sync Token / 推送密钥改成这里复制的 API Key。</li>
         </ul>
       </PagePanel>
@@ -162,6 +218,48 @@ onMounted(load)
 
 .settings-hint {
   font-size: 0.75rem;
+  color: hsl(var(--muted-foreground));
+}
+
+.settings-poll {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.settings-poll__btn {
+  height: 2.25rem;
+  border-radius: 0.75rem;
+  border: 1px solid hsl(var(--border));
+  background: hsl(var(--background));
+  padding: 0 0.9rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: hsl(var(--muted-foreground));
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.settings-poll__btn:hover:not(:disabled) {
+  border-color: hsl(var(--foreground) / 0.25);
+  color: hsl(var(--foreground));
+}
+
+.settings-poll__btn.active {
+  border-color: hsl(142 45% 40%);
+  background: hsl(142 40% 96%);
+  color: hsl(142 45% 28%);
+}
+
+.settings-poll__btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.settings-poll__desc {
+  margin: 0;
+  font-size: 0.75rem;
+  line-height: 1.5;
   color: hsl(var(--muted-foreground));
 }
 
