@@ -622,11 +622,15 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 			code = "AUTH"
 		case strings.Contains(low, "create_max_tasks_limit"), strings.Contains(low, "423"):
 			code = "BUSY"
+		case strings.Contains(low, "insufficient"), strings.Contains(low, "balance"),
+			strings.Contains(low, "remain"), strings.Contains(low, "coin"),
+			strings.Contains(low, "积分"), strings.Contains(low, "余额"):
+			code = "NO_COINS"
 		case strings.Contains(low, "prompt"), strings.Contains(low, "sensitive"):
 			code = "PROMPT"
 		}
 		_ = s.pool.ReleaseFail(acc.ID, code, msg)
-		if code == "BUSY" || code == "AUTH" {
+		if code == "BUSY" || code == "AUTH" || code == "NO_COINS" {
 			_ = s.store.RequeueTask(id, code, msg)
 			writeJSON(w, http.StatusAccepted, map[string]any{
 				"id": id, "status": "queued", "rh_task_id": "",

@@ -194,6 +194,20 @@ CREATE TABLE IF NOT EXISTS app_settings (
 		last_error LIKE '%FREQUENT%' OR
 		(last_error NOT LIKE 'AUTH:%' AND last_error NOT LIKE 'LOGIN:%')
 	)`)
+	// 已刷过余额且积分为 0 的活跃号：禁用，避免占调度位
+	if rows, qerr := s.db.Query(`SELECT id, remain_coins FROM accounts WHERE status='active' AND last_balance_at!=''`); qerr == nil {
+		for rows.Next() {
+			var id int64
+			var remain string
+			if rows.Scan(&id, &remain) != nil {
+				continue
+			}
+			if parseCoins(remain) <= 0 {
+				_ = s.DisableAccount(id, "NO_COINS: remain="+strings.TrimSpace(remain))
+			}
+		}
+		rows.Close()
+	}
 	if _, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS egress_nodes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -604,12 +618,20 @@ func (s *Store) SetAccountMaxConcurrency(id int64, maxConcurrency int) error {
 }
 
 func (s *Store) DisableAccount(id int64, reason string) error {
-	_, err := s.db.Exec(`UPDATE accounts SET status='disabled', lease_task_id='', lease_until='', last_error=?, updated_at=? WHERE id=?`, truncate(reason, 500), now(), id)
+	_, err := s.db.Exec(`UPDATE accounts SET
+  status='disabled',
+  inflight=0,
+  lease_task_id='',
+  lease_until='',
+  cooldown_until='',
+  last_error=?,
+  updated_at=?
+WHERE id=?`, truncate(reason, 500), now(), id)
 	return err
 }
 
 func (s *Store) EnableAccount(id int64) error {
-	_, err := s.db.Exec(`UPDATE accounts SET status='active', updated_at=? WHERE id=?`, now(), id)
+	_, err := s.db.Exec(`UPDATE accounts SET status='active', last_error='', updated_at=? WHERE id=?`, now(), id)
 	return err
 }
 
@@ -670,8 +692,18 @@ func (s *Store) UpdateAccountAuthTokens(id int64, accessToken, refreshToken stri
 }
 
 func (s *Store) UpdateAccountBalance(id int64, remainCoins, currentTaskCounts, apiType string) error {
+	ts := now()
 	_, err := s.db.Exec(`UPDATE accounts SET remain_coins=?, current_task_counts=?, api_type=?, last_balance_at=?, updated_at=? WHERE id=?`,
-		remainCoins, currentTaskCounts, apiType, now(), now(), id)
+		remainCoins, currentTaskCounts, apiType, ts, ts, id)
+	if err != nil {
+		return err
+	}
+	// 无积分：自动禁用，不参与调度；查余额/领积分后有币：仅恢复因无积分禁用的号
+	if parseCoins(remainCoins) <= 0 {
+		return s.DisableAccount(id, "NO_COINS: remain="+strings.TrimSpace(remainCoins))
+	}
+	_, err = s.db.Exec(`UPDATE accounts SET status='active', last_error='', updated_at=?
+WHERE id=? AND status='disabled' AND last_error LIKE 'NO_COINS%'`, ts, id)
 	return err
 }
 

@@ -57,7 +57,13 @@ func (p *Pool) ReleaseFail(id int64, code, msg string) error {
 			cooldown = 30 * time.Minute
 		}
 	}
-	return p.store.ReleaseAccountFail(id, code, msg, cooldown)
+	if err := p.store.ReleaseAccountFail(id, code, msg, cooldown); err != nil {
+		return err
+	}
+	if code == "NO_COINS" {
+		return p.store.DisableAccount(id, "NO_COINS: "+msg)
+	}
+	return nil
 }
 
 func (p *Pool) Disable(id int64, reason string) error {

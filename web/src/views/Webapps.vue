@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Button, Input } from 'nanocat-ui'
+import { Button, Input, ModalShell } from 'nanocat-ui'
 import PagePanel from '@/components/ai/PagePanel.vue'
 import TableShell from '@/components/ai/TableShell.vue'
 import TonePill from '@/components/TonePill.vue'
@@ -13,9 +13,9 @@ const router = useRouter()
 const webappId = ref('')
 const accessPassword = ref('')
 const loading = ref(false)
-const saving = ref(false)
+const detailLoading = ref(false)
 const error = ref('')
-const demo = ref(null)
+const detail = ref(null)
 const copied = ref('')
 const savedTemplates = ref([])
 const savedLoading = ref(false)
@@ -24,27 +24,26 @@ let fetchSeq = 0
 
 const base = computed(() => window.location.origin.replace(/\/$/, ''))
 
-const nodes = computed(() => demo.value?.node_info_list || [])
+const nodes = computed(() => detail.value?.node_info_list || [])
 
 const gatewayCurl = computed(() => {
-  const id = (webappId.value || demo.value?.webapp_id || '').trim() || '<webappId>'
+  const id = (webappId.value || detail.value?.webapp_id || '').trim() || '<webappId>'
   return `curl -s ${base.value}/v1/webapps/${id}/demo \\\n  -H "Authorization: Bearer <RH2API_API_KEY>"`
 })
 
 const submitExample = computed(() => {
-  if (!demo.value?.example?.body) return ''
-  // 下游示例不带 access_password：模板保存后由网关自动注入
-  return JSON.stringify(demo.value.example.body, null, 2)
+  if (!detail.value?.example?.body) return ''
+  return JSON.stringify(detail.value.example.body, null, 2)
 })
 
 const needsAccessPassword = computed(
   () =>
-    !!(demo.value?.access_encrypted || demo.value?.has_access_password) ||
+    !!(detail.value?.access_encrypted || detail.value?.has_access_password) ||
     !!String(accessPassword.value || '').trim(),
 )
 
-const alreadySaved = computed(() => {
-  const id = demo.value?.webapp_id
+const detailSaved = computed(() => {
+  const id = detail.value?.webapp_id
   if (!id) return null
   return savedTemplates.value.find((t) => t.webapp_id === id) || null
 })
@@ -85,10 +84,41 @@ async function loadSaved() {
   }
 }
 
+async function persistDemo(demo, { openDetail = false } = {}) {
+  const pwd = String(accessPassword.value || '').trim()
+  const existed = savedTemplates.value.find((t) => t.webapp_id === demo.webapp_id)
+  if (demo.access_encrypted && !pwd && !existed?.has_access_password) {
+    throw new Error('该应用开启了加密访问，请先填写访问密码再拉取保存')
+  }
+  const saved = await api.saveTemplate({
+    webapp_id: demo.webapp_id,
+    name: demo.name || demo.webapp_id,
+    description: demo.description || '',
+    source: demo.source || '',
+    access_password: pwd,
+    node_info_list: demo.node_info_list || [],
+    example: demo.example || null,
+  })
+  await loadSaved()
+  const name = String(demo.name || '').trim() || demo.webapp_id
+  // 后端按 webapp_id UNIQUE upsert：同 id 只更新，不新增
+  saveMsg.value = existed
+    ? `已拉取「${name}」，同 webappId 已更新（未新增）`
+    : `已拉取并新增保存「${name}」`
+  if (openDetail) {
+    detail.value = {
+      ...demo,
+      id: saved?.id || existed?.id || '',
+      has_access_password: !!pwd || !!existed?.has_access_password || !!demo.has_access_password,
+      cached: true,
+    }
+  }
+  return saved
+}
+
 async function fetchDemo() {
   error.value = ''
   saveMsg.value = ''
-  demo.value = null
   const id = webappId.value.trim()
   if (!id) {
     error.value = '请填写 webappId'
@@ -97,48 +127,14 @@ async function fetchDemo() {
   const seq = ++fetchSeq
   loading.value = true
   try {
-    // 管理端「拉取」强制走 RH；下游默认会命中已保存模板
     const res = await api.getWebappDemo(id, { refresh: true })
     if (seq !== fetchSeq) return
-    demo.value = res
+    await persistDemo(res, { openDetail: true })
   } catch (e) {
     if (seq !== fetchSeq) return
     error.value = e.message || String(e)
   } finally {
     if (seq === fetchSeq) loading.value = false
-  }
-}
-
-async function saveTemplate() {
-  if (!demo.value?.webapp_id) return
-  error.value = ''
-  saveMsg.value = ''
-  saving.value = true
-  try {
-    const pwd = String(accessPassword.value || '').trim()
-    if (demo.value.access_encrypted && !pwd && !alreadySaved.value?.has_access_password) {
-      throw new Error('该应用开启了加密访问，请填写访问密码后再保存')
-    }
-    const saved = await api.saveTemplate({
-      webapp_id: demo.value.webapp_id,
-      name: demo.value.name || demo.value.webapp_id,
-      description: demo.value.description || '',
-      source: demo.value.source || '',
-      access_password: pwd,
-      node_info_list: demo.value.node_info_list || [],
-      example: demo.value.example || null,
-    })
-    saveMsg.value = alreadySaved.value ? '已更新保存' : '已保存到模板库'
-    await loadSaved()
-    if (saved?.id) {
-      saveMsg.value = pwd
-        ? '已保存（含访问密码，下游提交无需再传）'
-        : '已保存，可在试跑工作室选择'
-    }
-  } catch (e) {
-    error.value = e.message || String(e)
-  } finally {
-    saving.value = false
   }
 }
 
@@ -148,8 +144,9 @@ async function removeSaved(id) {
   try {
     await api.deleteTemplate(id)
     await loadSaved()
-    if (demo.value && savedTemplates.value.every((t) => t.webapp_id !== demo.value.webapp_id)) {
-      saveMsg.value = ''
+    if (detail.value?.id === id || detail.value?.webapp_id) {
+      const still = savedTemplates.value.find((t) => t.webapp_id === detail.value.webapp_id)
+      if (!still) closeDetail()
     }
   } catch (e) {
     error.value = e.message || String(e)
@@ -160,14 +157,15 @@ function openInStudio(id) {
   router.push({ path: '/studio', query: { template: id } })
 }
 
-async function loadSavedIntoDemo(t) {
+async function openSavedDetail(t) {
   error.value = ''
-  saveMsg.value = ''
-  webappId.value = t.webapp_id
+  detailLoading.value = true
   try {
     const full = await api.getTemplate(t.id)
     accessPassword.value = full.access_password || ''
-    demo.value = {
+    webappId.value = full.webapp_id || t.webapp_id || ''
+    detail.value = {
+      id: full.id || t.id,
       webapp_id: full.webapp_id,
       name: full.name,
       description: full.description,
@@ -179,7 +177,13 @@ async function loadSavedIntoDemo(t) {
     }
   } catch (e) {
     error.value = e.message || String(e)
+  } finally {
+    detailLoading.value = false
   }
+}
+
+function closeDetail() {
+  detail.value = null
 }
 
 async function copy(text, key) {
@@ -204,16 +208,11 @@ onMounted(loadSaved)
         <div class="min-w-0">
           <h2 class="text-base font-semibold text-foreground">应用模板</h2>
           <p class="mt-1.5 max-w-2xl text-xs leading-relaxed text-muted-foreground">
-            拉取 RH 应用节点并保存到模板库；试跑工作室可直接选用。下游用
+            拉取成功后自动保存到模板库；点「查看」弹窗看节点详情。下游用
             <code class="rounded bg-muted/60 px-1 font-mono text-[11px]">/v1/webapps/{'{id}'}/demo</code>
             + 系统 API Key。
           </p>
         </div>
-        <TonePill
-          v-if="demo"
-          :tone="demoTone(demo)"
-          :label="demoLabel(demo)"
-        />
       </header>
 
       <section class="webapps-query">
@@ -236,7 +235,7 @@ onMounted(loadSaved)
             :disabled="loading"
             @click="fetchDemo"
           >
-            {{ loading ? '拉取中…' : '拉取模板' }}
+            {{ loading ? '拉取并保存…' : '拉取模板' }}
           </Button>
         </div>
         <label class="webapps-query__label" for="access-password-input">访问密码（加密应用）</label>
@@ -248,11 +247,11 @@ onMounted(loadSaved)
             size="md"
             block
             root-class="webapps-query__input"
-            placeholder="如 asdfghjkl；保存到模板后下游提交无需再传"
+            placeholder="加密应用先填密码；普通应用可留空"
           />
         </div>
         <p class="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
-          部分应用需访问密码才能运行。拉取后在此填写并「保存到模板」，网关提交时会自动带上。
+          加密应用需先填访问密码再拉取；普通应用拉取后会自动写入「已保存模板」。
         </p>
         <p v-if="error" class="webapps-query__error">{{ error }}</p>
         <p v-else-if="saveMsg" class="webapps-query__ok">{{ saveMsg }}</p>
@@ -315,7 +314,14 @@ onMounted(loadSaved)
               </td>
               <td class="px-3 py-2.5">
                 <div class="flex flex-wrap gap-1.5">
-                  <Button size="xs" variant="outline" @click="loadSavedIntoDemo(t)">查看</Button>
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    :disabled="detailLoading"
+                    @click="openSavedDetail(t)"
+                  >
+                    查看
+                  </Button>
                   <Button size="xs" variant="primary" @click="openInStudio(t.id)">试跑</Button>
                   <Button size="xs" variant="outline" @click="removeSaved(t.id)">删除</Button>
                 </div>
@@ -323,7 +329,7 @@ onMounted(loadSaved)
             </tr>
             <tr v-if="!savedTemplates.length">
               <td colspan="6" class="px-3 py-8 text-center text-muted-foreground">
-                暂无保存的模板，拉取后点「保存到模板库」
+                暂无保存的模板，上方填写 webappId 后点「拉取模板」
               </td>
             </tr>
           </tbody>
@@ -331,114 +337,116 @@ onMounted(loadSaved)
       </TableShell>
     </PagePanel>
 
-    <PagePanel v-if="demo" class="space-y-4">
-      <div class="flex flex-wrap items-start justify-between gap-3">
-        <div class="min-w-0">
-          <div class="flex flex-wrap items-center gap-2">
-            <h3 class="text-sm font-semibold text-foreground">{{ demo.name || '未命名应用' }}</h3>
-            <TonePill
-              v-if="needsAccessPassword"
-              :tone="accessPassword || demo.has_access_password ? 'success' : 'error'"
-              :label="accessPassword || demo.has_access_password ? '加密·已设密码' : '加密·需访问密码'"
-            />
-          </div>
-          <p class="mt-1 break-all font-mono text-xs text-muted-foreground">{{ demo.webapp_id }}</p>
-          <p v-if="demo.rh_key_account" class="mt-1 text-xs text-muted-foreground">
-            使用号池 Key：{{ demo.rh_key_account }}
-          </p>
+    <ModalShell
+      :open="!!detail"
+      :title="detail?.name || '模板详情'"
+      :description="detail?.webapp_id || ''"
+      size-class="max-w-4xl"
+      close-on-overlay
+      @close="closeDetail"
+    >
+      <div v-if="detail" class="max-h-[70vh] space-y-4 overflow-y-auto pr-1">
+        <div class="flex flex-wrap items-center gap-2">
+          <TonePill :tone="demoTone(detail)" :label="demoLabel(detail)" />
+          <TonePill
+            v-if="needsAccessPassword"
+            :tone="accessPassword || detail.has_access_password ? 'success' : 'error'"
+            :label="accessPassword || detail.has_access_password ? '加密·已设密码' : '加密·需访问密码'"
+          />
+          <span v-if="detail.rh_key_account" class="text-xs text-muted-foreground">
+            拉取号池 Key：{{ detail.rh_key_account }}
+          </span>
         </div>
-        <div class="flex flex-wrap gap-2">
-          <Button size="sm" variant="primary" :disabled="saving" @click="saveTemplate">
-            {{ saving ? '保存中…' : alreadySaved ? '更新保存' : '保存到模板库' }}
-          </Button>
+
+        <TableShell>
+          <table class="w-full text-left text-xs">
+            <thead>
+              <tr class="border-b border-border text-muted-foreground">
+                <th class="px-3 py-2.5 font-medium">nodeId</th>
+                <th class="px-3 py-2.5 font-medium">nodeName</th>
+                <th class="px-3 py-2.5 font-medium">fieldName</th>
+                <th class="px-3 py-2.5 font-medium">fieldType</th>
+                <th class="px-3 py-2.5 font-medium">默认值</th>
+                <th class="px-3 py-2.5 font-medium">可选/范围</th>
+                <th class="px-3 py-2.5 font-medium">说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="(n, i) in nodes"
+                :key="`${n.nodeId}-${n.fieldName}-${i}`"
+                class="border-b border-border/60"
+              >
+                <td class="px-3 py-2.5 font-mono">{{ n.nodeId }}</td>
+                <td class="px-3 py-2.5">{{ n.nodeName || '—' }}</td>
+                <td class="px-3 py-2.5 font-mono">{{ n.fieldName }}</td>
+                <td class="px-3 py-2.5">
+                  <TonePill
+                    v-if="n.fieldType"
+                    :tone="
+                      String(n.fieldType).toUpperCase() === 'IMAGE'
+                        ? 'info'
+                        : isListNode(n)
+                          ? 'success'
+                          : isNumberNode(n)
+                            ? 'info'
+                            : 'neutral'
+                    "
+                    :label="n.fieldType"
+                  />
+                  <span v-else>—</span>
+                </td>
+                <td
+                  class="max-w-[12rem] truncate px-3 py-2.5 font-mono text-muted-foreground"
+                  :title="formatFieldValue(n.fieldValue)"
+                >
+                  {{ formatFieldValue(n.fieldValue) }}
+                </td>
+                <td
+                  class="max-w-[16rem] truncate px-3 py-2.5 text-muted-foreground"
+                  :title="optionsSummary(n) || ''"
+                >
+                  {{ optionsSummary(n) || '—' }}
+                </td>
+                <td
+                  class="max-w-[14rem] truncate px-3 py-2.5 text-muted-foreground"
+                  :title="n.description || ''"
+                >
+                  {{ n.description || '—' }}
+                </td>
+              </tr>
+              <tr v-if="!nodes.length">
+                <td colspan="7" class="px-3 py-8 text-center text-muted-foreground">无节点</td>
+              </tr>
+            </tbody>
+          </table>
+        </TableShell>
+
+        <section v-if="submitExample" class="webapps-code">
+          <div class="webapps-code__bar">
+            <p class="webapps-code__title">下游提交 body</p>
+            <Button size="xs" variant="outline" @click="copy(submitExample, 'body')">
+              {{ copied === 'body' ? '已复制' : '复制' }}
+            </Button>
+          </div>
+          <pre class="webapps-code__pre"><code>{{ submitExample }}</code></pre>
+        </section>
+      </div>
+
+      <template #footer>
+        <div class="flex flex-wrap justify-end gap-2">
+          <Button size="sm" variant="outline" @click="closeDetail">关闭</Button>
           <Button
-            v-if="alreadySaved"
+            v-if="detailSaved?.id || detail?.id"
             size="sm"
-            variant="outline"
-            @click="openInStudio(alreadySaved.id)"
+            variant="primary"
+            @click="openInStudio(detailSaved?.id || detail.id)"
           >
             去试跑
           </Button>
-          <Button size="sm" variant="outline" :disabled="!submitExample" @click="copy(submitExample, 'body')">
-            {{ copied === 'body' ? '已复制 body' : '复制提交 body' }}
-          </Button>
         </div>
-      </div>
-
-      <TableShell>
-        <table class="w-full text-left text-xs">
-          <thead>
-            <tr class="border-b border-border text-muted-foreground">
-              <th class="px-3 py-2.5 font-medium">nodeId</th>
-              <th class="px-3 py-2.5 font-medium">nodeName</th>
-              <th class="px-3 py-2.5 font-medium">fieldName</th>
-              <th class="px-3 py-2.5 font-medium">fieldType</th>
-              <th class="px-3 py-2.5 font-medium">默认值</th>
-              <th class="px-3 py-2.5 font-medium">可选/范围</th>
-              <th class="px-3 py-2.5 font-medium">说明</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr
-              v-for="(n, i) in nodes"
-              :key="`${n.nodeId}-${n.fieldName}-${i}`"
-              class="border-b border-border/60"
-            >
-              <td class="px-3 py-2.5 font-mono">{{ n.nodeId }}</td>
-              <td class="px-3 py-2.5">{{ n.nodeName || '—' }}</td>
-              <td class="px-3 py-2.5 font-mono">{{ n.fieldName }}</td>
-              <td class="px-3 py-2.5">
-                <TonePill
-                  v-if="n.fieldType"
-                  :tone="
-                    String(n.fieldType).toUpperCase() === 'IMAGE'
-                      ? 'info'
-                      : isListNode(n)
-                        ? 'success'
-                        : isNumberNode(n)
-                          ? 'info'
-                          : 'neutral'
-                  "
-                  :label="n.fieldType"
-                />
-                <span v-else>—</span>
-              </td>
-              <td
-                class="max-w-[12rem] truncate px-3 py-2.5 font-mono text-muted-foreground"
-                :title="formatFieldValue(n.fieldValue)"
-              >
-                {{ formatFieldValue(n.fieldValue) }}
-              </td>
-              <td
-                class="max-w-[16rem] truncate px-3 py-2.5 text-muted-foreground"
-                :title="optionsSummary(n) || ''"
-              >
-                {{ optionsSummary(n) || '—' }}
-              </td>
-              <td
-                class="max-w-[14rem] truncate px-3 py-2.5 text-muted-foreground"
-                :title="n.description || ''"
-              >
-                {{ n.description || '—' }}
-              </td>
-            </tr>
-            <tr v-if="!nodes.length">
-              <td colspan="7" class="px-3 py-8 text-center text-muted-foreground">无节点</td>
-            </tr>
-          </tbody>
-        </table>
-      </TableShell>
-
-      <section v-if="submitExample" class="webapps-code">
-        <div class="webapps-code__bar">
-          <p class="webapps-code__title">下游提交 body（改本应用 node_info_list；加密应用密码已由模板注入）</p>
-          <Button size="xs" variant="outline" @click="copy(submitExample, 'body2')">
-            {{ copied === 'body2' ? '已复制' : '复制' }}
-          </Button>
-        </div>
-        <pre class="webapps-code__pre"><code>{{ submitExample }}</code></pre>
-      </section>
-    </PagePanel>
+      </template>
+    </ModalShell>
   </div>
 </template>
 

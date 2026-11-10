@@ -8,12 +8,43 @@ import { api } from '@/api'
 import { progressLabel, progressTone, statusLabel, statusTone } from '@/lib/taskLabels'
 
 const rows = ref([])
+const templates = ref([])
 const error = ref('')
 const okmsg = ref('')
 const detail = ref(null)
 const busyId = ref('')
 let timer
 const toolbarButtonClass = 'h-8 justify-center px-3 text-xs'
+
+const templateById = computed(() => {
+  const map = {}
+  for (const t of templates.value || []) {
+    if (t?.id) map[t.id] = t
+  }
+  return map
+})
+
+const templateByWebapp = computed(() => {
+  const map = {}
+  for (const t of templates.value || []) {
+    const wid = String(t?.webapp_id || '').trim()
+    if (wid) map[wid] = t
+  }
+  return map
+})
+
+function templateMeta(t) {
+  if (!t) return { label: '', copy: '' }
+  const byId = t.template_id ? templateById.value[t.template_id] : null
+  const byWeb = t.webapp_id ? templateByWebapp.value[String(t.webapp_id).trim()] : null
+  const hit = byId || byWeb
+  if (hit?.name) {
+    return { label: hit.name, copy: hit.id || t.template_id || t.webapp_id || '' }
+  }
+  if (t.template_id) return { label: t.template_id, copy: t.template_id }
+  if (t.webapp_id) return { label: t.webapp_id, copy: t.webapp_id }
+  return { label: '', copy: '' }
+}
 
 const detailLive = computed(() => {
   if (!detail.value?.id) return null
@@ -32,7 +63,8 @@ const detailFields = computed(() => {
     { label: 'RH 状态', value: t.rh_status || '—' },
     { label: '进度', value: progressLabel(t) },
     { label: '排队', value: t.queue_count ? `${t.queue_index}/${t.queue_count}` : '—' },
-    { label: 'Webapp', value: t.webapp_id || '—', mono: true },
+    { label: '模板', value: templateMeta(t).label || '—', mono: !templateById.value[t.template_id]?.name && !templateByWebapp.value[String(t.webapp_id || '').trim()]?.name, copy: !!templateMeta(t).copy },
+    { label: 'Webapp', value: t.webapp_id || '—', mono: true, copy: !!t.webapp_id },
     { label: '模板 ID', value: t.template_id || '—', mono: true, copy: !!t.template_id },
     { label: '时长', value: t.duration || '—' },
     { label: '画幅', value: t.aspect_ratio || '—' },
@@ -48,6 +80,15 @@ const detailFields = computed(() => {
     { label: 'Prompt', value: t.prompt || '—', wide: true, pre: true },
   ]
 })
+
+async function refreshTemplates() {
+  try {
+    const res = await api.listTemplates()
+    templates.value = Array.isArray(res?.data) ? res.data : []
+  } catch {
+    templates.value = []
+  }
+}
 
 async function refresh() {
   error.value = ''
@@ -118,6 +159,7 @@ watch(rows, () => {
 })
 
 onMounted(() => {
+  refreshTemplates()
   refresh()
   timer = setInterval(refresh, 3000)
 })
@@ -146,7 +188,7 @@ onUnmounted(() => clearInterval(timer))
             <tr>
               <th class="py-3 pr-5">本地 ID</th>
               <th class="py-3 pr-5">账号</th>
-              <th class="py-3 pr-5">模板</th>
+              <th class="py-3 pr-5">模板/应用</th>
               <th class="py-3 pr-5">RH Task</th>
               <th class="py-3 pr-5">状态</th>
               <th class="py-3 pr-5">进度</th>
@@ -163,11 +205,13 @@ onUnmounted(() => clearInterval(timer))
               <td class="py-3 pr-5">{{ t.account_email || '—' }}</td>
               <td class="py-3 pr-5">
                 <button
-                  v-if="t.template_id"
+                  v-if="templateMeta(t).label"
                   type="button"
-                  class="font-mono text-xs text-muted-foreground hover:underline"
-                  @click="copy(t.template_id)"
-                >{{ t.template_id }}</button>
+                  class="max-w-[12rem] truncate text-left text-xs text-muted-foreground hover:underline"
+                  :class="templateMeta(t).label === t.webapp_id || templateMeta(t).label === t.template_id ? 'font-mono' : ''"
+                  :title="[t.template_id, t.webapp_id].filter(Boolean).join(' · ')"
+                  @click="copy(templateMeta(t).copy)"
+                >{{ templateMeta(t).label }}</button>
                 <span v-else class="text-muted-foreground">—</span>
               </td>
               <td class="py-3 pr-5">
