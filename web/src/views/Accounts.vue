@@ -19,6 +19,8 @@ const showAdd = ref(false)
 const keyword = ref('')
 const busyId = ref(0)
 const actionMenuId = ref(0)
+const actionMenuStyle = ref({})
+const actionMenuRow = ref(null)
 const selectedIds = ref(new Set())
 const detail = ref(null)
 const detailLoading = ref(false)
@@ -27,12 +29,51 @@ const savingConcurrency = ref(false)
 const headerCheckEl = ref(null)
 const toolbarButtonClass = 'h-8 justify-center px-3 text-xs'
 
-function toggleActionMenu(id) {
-  actionMenuId.value = actionMenuId.value === id ? 0 : id
+function placeActionMenu(anchorEl) {
+  if (!anchorEl?.getBoundingClientRect) {
+    actionMenuStyle.value = {}
+    return
+  }
+  const rect = anchorEl.getBoundingClientRect()
+  const menuWidth = 132
+  const menuHeight = 152
+  const gap = 4
+  const left = Math.min(
+    Math.max(8, rect.right - menuWidth),
+    window.innerWidth - menuWidth - 8,
+  )
+  const openUp = rect.bottom + gap + menuHeight > window.innerHeight - 8
+  const top = openUp
+    ? Math.max(8, rect.top - gap - menuHeight)
+    : Math.min(rect.bottom + gap, window.innerHeight - menuHeight - 8)
+  actionMenuStyle.value = {
+    position: 'fixed',
+    top: `${Math.round(top)}px`,
+    left: `${Math.round(left)}px`,
+    width: `${menuWidth}px`,
+    zIndex: 80,
+  }
+}
+
+function toggleActionMenu(id, event) {
+  if (actionMenuId.value === id) {
+    closeActionMenu()
+    return
+  }
+  actionMenuId.value = id
+  actionMenuRow.value = rows.value.find((row) => row.id === id) || null
+  placeActionMenu(event?.currentTarget)
 }
 
 function closeActionMenu() {
   actionMenuId.value = 0
+  actionMenuRow.value = null
+  actionMenuStyle.value = {}
+}
+
+function onActionMenuReposition() {
+  if (!actionMenuId.value) return
+  closeActionMenu()
 }
 
 async function runRowAction(row, action) {
@@ -523,11 +564,15 @@ function onDocClick(e) {
 
 onMounted(() => {
   document.addEventListener('click', onDocClick)
+  window.addEventListener('resize', onActionMenuReposition)
+  window.addEventListener('scroll', onActionMenuReposition, true)
   refresh()
 })
 
 onUnmounted(() => {
   document.removeEventListener('click', onDocClick)
+  window.removeEventListener('resize', onActionMenuReposition)
+  window.removeEventListener('scroll', onActionMenuReposition, true)
 })
 </script>
 
@@ -639,6 +684,7 @@ onUnmounted(() => {
                 />
               </th>
               <th class="py-3 pr-5">账号</th>
+              <th class="py-3 px-3 text-center">Token</th>
               <th class="py-3 pr-5">状态</th>
               <th class="py-3 pr-5">可调度</th>
               <th class="py-3 pr-5">RH币</th>
@@ -648,7 +694,6 @@ onUnmounted(() => {
               <th class="py-3 px-3 text-center">并发</th>
               <th class="py-3 px-3 text-center">RH在途</th>
               <th class="py-3 px-3 text-center">Key</th>
-              <th class="py-3 px-3 text-center">Token</th>
               <th class="py-3 px-3 text-center">冷却</th>
               <th class="py-3 px-3 text-center">失败</th>
               <th class="py-3 pr-5">来源</th>
@@ -673,6 +718,12 @@ onUnmounted(() => {
                 >
                   {{ a.email }}
                 </button>
+              </td>
+              <td class="px-3 py-3 text-center">
+                <div class="inline-flex flex-wrap justify-center gap-1">
+                  <TonePill :tone="tokenTone(a.has_access_token)" :label="tokenLabel('AT', a.has_access_token)" />
+                  <TonePill :tone="tokenTone(a.has_refresh_token)" :label="tokenLabel('RT', a.has_refresh_token)" />
+                </div>
               </td>
               <td class="py-3 pr-5">
                 <TonePill :tone="statusTone(a.status)" :label="statusLabel(a.status)" />
@@ -701,60 +752,18 @@ onUnmounted(() => {
                   />
                 </div>
               </td>
-              <td class="px-3 py-3 text-center">
-                <div class="inline-flex flex-wrap justify-center gap-1">
-                  <TonePill :tone="tokenTone(a.has_access_token)" :label="tokenLabel('AT', a.has_access_token)" />
-                  <TonePill :tone="tokenTone(a.has_refresh_token)" :label="tokenLabel('RT', a.has_refresh_token)" />
-                </div>
-              </td>
               <td class="px-3 py-3 text-center font-mono text-xs text-muted-foreground">{{ a.cooldown_until || '—' }}</td>
               <td class="px-3 py-3 text-center">{{ a.fail_count }}</td>
               <td class="py-3 pr-5 text-muted-foreground">{{ a.source || '—' }}</td>
-              <td class="relative px-3 py-3 text-center" data-account-action-menu>
+              <td class="px-3 py-3 text-center" data-account-action-menu>
                 <Button
                   size="xs"
                   variant="outline"
                   :disabled="busyId === a.id || batchBusy"
-                  @click.stop="toggleActionMenu(a.id)"
+                  @click.stop="toggleActionMenu(a.id, $event)"
                 >
                   操作
                 </Button>
-                <div
-                  v-if="actionMenuId === a.id"
-                  class="absolute right-3 z-20 mt-1 min-w-[7.5rem] overflow-hidden rounded-xl border border-border bg-card py-1 text-left shadow-lg"
-                >
-                  <button
-                    type="button"
-                    class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
-                    @click="runRowAction(a, 'detail')"
-                  >
-                    详情
-                  </button>
-                  <button
-                    type="button"
-                    class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
-                    :disabled="busyId === a.id || batchBusy"
-                    @click="runRowAction(a, 'ensureKey')"
-                  >
-                    {{ a.has_api_key ? '重置Key' : '补Key' }}
-                  </button>
-                  <button
-                    type="button"
-                    class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
-                    :disabled="busyId === a.id || batchBusy"
-                    @click="runRowAction(a, 'refresh')"
-                  >
-                    刷新
-                  </button>
-                  <button
-                    type="button"
-                    class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
-                    :disabled="busyId === a.id || batchBusy"
-                    @click="runRowAction(a, 'toggleStatus')"
-                  >
-                    {{ a.status === 'active' ? '禁用' : '启用' }}
-                  </button>
-                </div>
               </td>
             </tr>
             <tr v-if="!filtered.length">
@@ -765,6 +774,48 @@ onUnmounted(() => {
           </tbody>
         </table>
       </TableShell>
+
+      <Teleport to="body">
+        <div
+          v-if="actionMenuId && actionMenuRow"
+          data-account-action-menu
+          class="overflow-hidden rounded-xl border border-border bg-card py-1 text-left shadow-lg"
+          :style="actionMenuStyle"
+          @click.stop
+        >
+          <button
+            type="button"
+            class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
+            @click="runRowAction(actionMenuRow, 'detail')"
+          >
+            详情
+          </button>
+          <button
+            type="button"
+            class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
+            :disabled="busyId === actionMenuRow.id || batchBusy"
+            @click="runRowAction(actionMenuRow, 'ensureKey')"
+          >
+            {{ actionMenuRow.has_api_key ? '重置Key' : '补Key' }}
+          </button>
+          <button
+            type="button"
+            class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
+            :disabled="busyId === actionMenuRow.id || batchBusy"
+            @click="runRowAction(actionMenuRow, 'refresh')"
+          >
+            刷新
+          </button>
+          <button
+            type="button"
+            class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
+            :disabled="busyId === actionMenuRow.id || batchBusy"
+            @click="runRowAction(actionMenuRow, 'toggleStatus')"
+          >
+            {{ actionMenuRow.status === 'active' ? '禁用' : '启用' }}
+          </button>
+        </div>
+      </Teleport>
     </PagePanel>
 
     <ModalShell

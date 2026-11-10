@@ -16,6 +16,8 @@ type Config struct {
 	BaseURL       string
 	WebappID      string
 	Workers       int
+	// SubmitGapSec: minimum seconds between two RH submits on the same account (default 3).
+	SubmitGapSec int
 	// PollAuth: "apikey" (RH openapi status/outputs) or "at" (Bearer access_token task/list).
 	PollAuth string
 
@@ -39,6 +41,10 @@ func Load() Config {
 	workers, _ := strconv.Atoi(env("RH2API_WORKERS", "2"))
 	if workers < 1 {
 		workers = 1
+	}
+	submitGapSec, _ := strconv.Atoi(env("RH2API_SUBMIT_GAP_SEC", "3"))
+	if submitGapSec < 0 {
+		submitGapSec = 0
 	}
 
 	adminKey := env("RH2API_ADMIN_KEY", "")
@@ -70,6 +76,7 @@ func Load() Config {
 		BaseURL:       strings.TrimRight(env("RH2API_BASE_URL", "https://www.runninghub.ai"), "/"),
 		WebappID:      env("RH2API_WEBAPP_ID", "2099427470494662657"),
 		Workers:       workers,
+		SubmitGapSec:  submitGapSec,
 		PollAuth:      NormalizePollAuth(env("RH2API_POLL_AUTH", "apikey")),
 		AuthKey:       authKey,
 		AdminKey:      adminKey,

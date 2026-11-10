@@ -22,9 +22,11 @@ defineProps({
 <style scoped>
 .table-shell {
   min-width: 0;
+  min-height: 18rem;
 }
 .table-shell__scroll {
   overflow-x: auto;
+  min-height: 18rem;
 }
 .table-shell__footer {
   padding: var(--table-shell-footer-padding, 12px 16px);

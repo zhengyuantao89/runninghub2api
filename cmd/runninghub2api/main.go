@@ -25,7 +25,7 @@ func main() {
 	}
 	defer st.Close()
 
-	pool := accounts.New(st)
+	pool := accounts.New(st, time.Duration(cfg.SubmitGapSec)*time.Second)
 	worker := tasks.NewWorker(st, pool, cfg)
 	worker.Start(cfg.Workers)
 	defer worker.Stop()

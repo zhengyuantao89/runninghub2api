@@ -104,6 +104,12 @@ func loginClient(in RunInput) (*Client, error) {
 	}
 	client.ApplyIdentity(in.AnonymousID, in.FingerprintJSON)
 
+	// 提交 /task/webapp/create 走 Bearer AT。已有 AT 时绝不再 PwdLogin，
+	// 否则会打爆 RH 登录限流（FREQUENT_OPER）并把号误冷却。
+	if at := strings.TrimSpace(in.AccessToken); at != "" {
+		client.SetAccessToken(at)
+		return client, nil
+	}
 	if strings.TrimSpace(in.Email) != "" && strings.TrimSpace(in.Password) != "" {
 		login, err := client.PwdLogin(in.Email, in.Password)
 		if err != nil {
@@ -117,10 +123,6 @@ func loginClient(in RunInput) (*Client, error) {
 			return nil, fmt.Errorf("login missing access_token")
 		}
 		client.SetAccessToken(token)
-		return client, nil
-	}
-	if strings.TrimSpace(in.AccessToken) != "" {
-		client.SetAccessToken(in.AccessToken)
 		return client, nil
 	}
 	return nil, fmt.Errorf("email+password or access_token required")
@@ -167,7 +169,7 @@ func needsUpload(v any) bool {
 	return low == "__upload__" || low == "__image__" || low == "@image" || strings.HasPrefix(low, "upload:")
 }
 
-// SubmitWebappVideo logs in, uploads, creates the RH webapp task and returns as soon as taskId is known.
+// SubmitWebappVideo uses existing AT when present (else pwdLogin), uploads, creates RH webapp task.
 func SubmitWebappVideo(in RunInput) (*Session, error) {
 	webappID := in.resolveWebappID()
 	client, err := loginClient(in)

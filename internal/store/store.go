@@ -43,6 +43,7 @@ type Account struct {
 	Source            string `json:"source"`
 	ExternalID        string `json:"external_id,omitempty"`
 	CooldownUntil      string `json:"cooldown_until,omitempty"`
+	LastSubmitAt      string `json:"last_submit_at,omitempty"`
 	FailCount         int    `json:"fail_count"`
 	LastError         string `json:"last_error,omitempty"`
 	LeaseTaskID       string `json:"lease_task_id,omitempty"`
@@ -180,6 +181,7 @@ CREATE TABLE IF NOT EXISTS app_settings (
 		{"egress_id", "egress_id INTEGER NOT NULL DEFAULT 0"},
 		{"max_concurrency", "max_concurrency INTEGER NOT NULL DEFAULT 1"},
 		{"inflight", "inflight INTEGER NOT NULL DEFAULT 0"},
+		{"last_submit_at", "last_submit_at TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := s.addColumnIfMissing("accounts", col.name, col.ddl); err != nil {
 			return err
@@ -187,6 +189,11 @@ CREATE TABLE IF NOT EXISTS app_settings (
 	}
 	// 旧数据：若仍占用租约但 inflight=0，补 1，避免升级后立刻重复派发
 	_, _ = s.db.Exec(`UPDATE accounts SET inflight=1 WHERE inflight=0 AND lease_task_id!='' AND lease_until!=''`)
+	// RH 业务失败不应冷却账号；FREQUENT_OPER 是登录限流误冷却，一并清掉
+	_, _ = s.db.Exec(`UPDATE accounts SET cooldown_until='' WHERE cooldown_until!='' AND (
+		last_error LIKE '%FREQUENT%' OR
+		(last_error NOT LIKE 'AUTH:%' AND last_error NOT LIKE 'LOGIN:%')
+	)`)
 	if _, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS egress_nodes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -316,7 +323,7 @@ func (s *Store) addColumnIfMissing(table, name, ddl string) error {
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
 
-const accountSelect = `SELECT id,email,password,access_token,refresh_token,api_key,identify,rh_user_id,remain_coins,current_task_counts,api_type,last_balance_at,last_login_coin_at,anonymous_id,device_id,fingerprint_json,egress_id,max_concurrency,inflight,status,source,external_id,cooldown_until,fail_count,last_error,lease_task_id,lease_until,created_at,updated_at FROM accounts`
+const accountSelect = `SELECT id,email,password,access_token,refresh_token,api_key,identify,rh_user_id,remain_coins,current_task_counts,api_type,last_balance_at,last_login_coin_at,anonymous_id,device_id,fingerprint_json,egress_id,max_concurrency,inflight,status,source,external_id,cooldown_until,last_submit_at,fail_count,last_error,lease_task_id,lease_until,created_at,updated_at FROM accounts`
 
 const taskSelect = `SELECT id,status,prompt,image_path,webapp_id,template_id,duration,aspect_ratio,node_info_json,account_id,account_email,rh_task_id,rh_status,queue_index,queue_count,progress_text,file_url,preview_url,error_code,error,attempts,created_at,updated_at,finished_at FROM video_tasks`
 
@@ -437,7 +444,7 @@ func (s *Store) reclaimExpiredLeases(nowTs time.Time) {
 	)
 }
 
-func (s *Store) ListDispatchableAccounts() ([]Account, error) {
+func (s *Store) ListDispatchableAccounts(submitGap time.Duration) ([]Account, error) {
 	nowTs := time.Now().UTC()
 	s.reclaimExpiredLeases(nowTs)
 	rows, err := s.db.Query(accountSelect + ` WHERE status='active' ORDER BY updated_at ASC, id ASC`)
@@ -456,6 +463,12 @@ func (s *Store) ListDispatchableAccounts() ([]Account, error) {
 		}
 		if until, err := time.Parse(time.RFC3339, a.CooldownUntil); err == nil && until.After(nowTs) {
 			continue
+		}
+		// 同号两次提交间隔，避免 RH 失败后立刻连打
+		if submitGap > 0 && a.LastSubmitAt != "" {
+			if t, err := time.Parse(time.RFC3339, a.LastSubmitAt); err == nil && t.Add(submitGap).After(nowTs) {
+				continue
+			}
 		}
 		// 本网关槽位未满才可再派
 		if a.Inflight >= a.MaxSlots() {
@@ -523,10 +536,11 @@ UPDATE accounts SET
   inflight = inflight + 1,
   lease_task_id = ?,
   lease_until = ?,
+  last_submit_at = ?,
   updated_at = ?
 WHERE id = ?
   AND inflight < CASE WHEN max_concurrency < 1 THEN 1 ELSE max_concurrency END
-`, taskID, until, ts, id)
+`, taskID, until, ts, ts, id)
 	if err != nil {
 		return err
 	}
@@ -808,7 +822,7 @@ func (s *Store) scanAccount(row rowScanner) (Account, error) {
 		&a.ID, &a.Email, &a.Password, &a.AccessToken, &a.RefreshToken, &a.APIKey, &a.Identify, &a.RHUserID,
 		&a.RemainCoins, &a.CurrentTaskCounts, &a.APIType, &a.LastBalanceAt, &a.LastLoginCoinAt,
 		&a.AnonymousID, &a.DeviceID, &a.FingerprintJSON, &a.EgressID, &a.MaxConcurrency, &a.Inflight,
-		&a.Status, &a.Source, &a.ExternalID, &a.CooldownUntil, &a.FailCount, &a.LastError,
+		&a.Status, &a.Source, &a.ExternalID, &a.CooldownUntil, &a.LastSubmitAt, &a.FailCount, &a.LastError,
 		&a.LeaseTaskID, &a.LeaseUntil, &a.CreatedAt, &a.UpdatedAt,
 	)
 	if err == nil && a.MaxConcurrency < 1 {
