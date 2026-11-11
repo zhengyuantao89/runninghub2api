@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// EgressNode mirrors gpt-plus proxies.toItem shape (single-tenant, password plaintext).
+// EgressNode is a single-tenant egress proxy row (password plaintext).
 type EgressNode struct {
 	ID               int64  `json:"id"`
 	GroupName        string `json:"group_name"`
@@ -76,14 +76,40 @@ func (s *Store) GetEgress(id int64) (EgressNode, error) {
 }
 
 func (s *Store) ListEgress(group string) ([]EgressNode, error) {
+	return s.ListEgressPage(group, 0, 0)
+}
+
+func (s *Store) CountEgress(group string) (int, error) {
 	group = strings.TrimSpace(group)
-	var rows *sql.Rows
+	var n int
 	var err error
 	if group != "" {
-		rows, err = s.db.Query(egressSelect+` WHERE group_name=? ORDER BY id DESC`, group)
+		err = s.db.QueryRow(`SELECT COUNT(*) FROM egress_nodes WHERE group_name=?`, group).Scan(&n)
 	} else {
-		rows, err = s.db.Query(egressSelect + ` ORDER BY id DESC`)
+		err = s.db.QueryRow(`SELECT COUNT(*) FROM egress_nodes`).Scan(&n)
 	}
+	return n, err
+}
+
+// ListEgressPage returns egress nodes ordered by id DESC.
+// limit<=0 means no LIMIT; offset is ignored when limit<=0.
+func (s *Store) ListEgressPage(group string, limit, offset int) ([]EgressNode, error) {
+	group = strings.TrimSpace(group)
+	q := egressSelect
+	args := make([]any, 0, 3)
+	if group != "" {
+		q += ` WHERE group_name=?`
+		args = append(args, group)
+	}
+	q += ` ORDER BY id DESC`
+	if limit > 0 {
+		if offset < 0 {
+			offset = 0
+		}
+		q += ` LIMIT ? OFFSET ?`
+		args = append(args, limit, offset)
+	}
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +369,7 @@ type SyncStats struct {
 	Total   int `json:"total"`
 }
 
-// ExactSyncEgressGroup mirrors gpt-plus subscription exact sync for a fixed group.
+// ExactSyncEgressGroup exact-syncs egress nodes for a fixed group.
 func (s *Store) ExactSyncEgressGroup(group string, desired []EgressNode, fingerprint func(EgressNode) string) (SyncStats, error) {
 	group = strings.TrimSpace(group)
 	if group == "" {

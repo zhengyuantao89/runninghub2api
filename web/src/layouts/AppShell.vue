@@ -17,9 +17,15 @@
           class="flex h-16 items-center pt-4 lg:h-20 lg:pt-5"
           :class="isSidebarRail ? 'justify-center px-2' : 'justify-between px-6'"
         >
-          <div class="flex w-full items-center" :class="isSidebarRail ? 'justify-center' : ''">
-            <p v-if="!isSidebarRail" class="ui-section-title">runninghub2api</p>
-            <span v-else class="text-sm font-semibold text-foreground" aria-label="runninghub2api">RH</span>
+          <div class="flex w-full items-center gap-2.5" :class="isSidebarRail ? 'justify-center' : ''">
+            <BrandMark :size="isSidebarRail ? 'md' : 'lg'" :decorative="false" />
+            <div v-if="!isSidebarRail" class="min-w-0">
+              <p class="ui-section-title">runninghub2api</p>
+              <p class="mt-0.5 truncate text-xs text-muted-foreground">
+                {{ isAdmin ? '管理控制台' : '用户控制台' }}
+                <span v-if="username"> · {{ username }}</span>
+              </p>
+            </div>
           </div>
         </div>
 
@@ -98,7 +104,8 @@
                 <path d="M4 6h16v2H4V6zm0 5h16v2H4v-2zm0 5h16v2H4v-2z" />
               </svg>
             </Button>
-            <div class="flex min-w-0 flex-wrap items-center gap-2">
+            <div class="flex min-w-0 flex-wrap items-center gap-3">
+              <BrandMark size="lg" />
               <h2 class="text-xl font-semibold text-foreground lg:text-2xl">
                 {{ currentPageTitle }}
               </h2>
@@ -109,7 +116,7 @@
               {{ themeButtonText }}
             </Button>
             <Button size="sm" variant="outline" title="刷新" @click="refreshPage">刷新</Button>
-            <Button size="sm" variant="outline" title="接口信息" @click="router.push('/docs')">接口信息</Button>
+            <Button size="sm" variant="outline" title="接口信息" @click="router.push(docsPath)">接口信息</Button>
           </div>
         </header>
 
@@ -118,7 +125,6 @@
         </div>
       </main>
     </div>
-
   </div>
 </template>
 
@@ -126,7 +132,9 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { Button } from 'nanocat-ui'
-import { api, clearSession } from '@/api'
+import BrandMark from '@/components/BrandMark.vue'
+import { api, clearSession, getRole, setRole } from '@/api'
+import { consoleBaseFromPath, isAdminRole } from '@/lib/auth'
 import { getBooleanPreference, preferenceKeys, setBooleanPreference } from '@/lib/preferences'
 import { applyThemeMode, getStoredThemeMode, setStoredThemeMode } from '@/lib/theme'
 
@@ -135,49 +143,52 @@ const router = useRouter()
 const isSidebarOpen = ref(false)
 const isSidebarCollapsed = ref(getBooleanPreference(preferenceKeys.sidebarCollapsed, false))
 const themeMode = ref(getStoredThemeMode())
+const username = ref('')
 
-const menuItems = [
-  {
-    path: '/',
-    label: '概览中心',
-    icon: 'M4 4h7v7H4V4zm9 0h7v4h-7V4zm0 6h7v10h-7V10zM4 13h7v7H4v-7z',
-  },
-  {
-    path: '/accounts',
-    label: '号池管理',
-    icon: 'M12 12a3.5 3.5 0 1 0-3.5-3.5A3.5 3.5 0 0 0 12 12zm0 2c-4.1 0-7.5 2.2-7.5 5v1h15v-1c0-2.8-3.4-5-7.5-5z',
-  },
-  {
-    path: '/egress',
-    label: '出口池',
-    icon: 'M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm1 14.93V19h-2v-2.07A8 8 0 0 1 4.07 13H2v-2h2.07A8 8 0 0 1 11 4.07V2h2v2.07A8 8 0 0 1 19.93 11H22v2h-2.07A8 8 0 0 1 13 16.93z',
-  },
-  {
-    path: '/webapps',
-    label: '应用模板',
-    icon: 'M4 4h7v7H4V4zm9 0h7v7h-7V4zM4 13h7v7H4v-7zm9 0h7v7h-7v-7z',
-  },
-  {
-    path: '/tasks',
-    label: '任务队列',
-    icon: 'M4 6h16v2H4V6zm0 5h16v2H4v-2zm0 5h10v2H4v-2z',
-  },
-  {
-    path: '/studio',
-    label: '试跑工作室',
-    icon: 'M5 4h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-5l-4 4v-4H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm1 3v6h12V7H6zm2 2 2.1 2.8 2.4-3.1L17 14H7l1-5z',
-  },
-  {
-    path: '/docs',
-    label: 'API 说明',
-    icon: 'M6 3h9l5 5v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm8 1.5V9h4.5L14 4.5zM8 12h8v2H8v-2zm0 4h8v2H8v-2z',
-  },
-  {
-    path: '/settings',
-    label: '系统设置',
-    icon: 'M4 6h10v2H4V6zm12 0h4v2h-4V6zM4 11h6v2H4v-2zm8 0h8v2h-8v-2zM4 16h10v2H4v-2zm12 0h4v2h-4v-2z',
-  },
-]
+const consoleBase = computed(() => consoleBaseFromPath(route.path))
+const isAdmin = computed(() => isAdminRole(getRole()) || consoleBase.value === '/admin')
+const docsPath = computed(() => `${consoleBase.value}/docs`)
+
+const icons = {
+  dash: 'M4 4h7v7H4V4zm9 0h7v4h-7V4zm0 6h7v10h-7V10zM4 13h7v7H4v-7z',
+  accounts: 'M12 12a3.5 3.5 0 1 0-3.5-3.5A3.5 3.5 0 0 0 12 12zm0 2c-4.1 0-7.5 2.2-7.5 5v1h15v-1c0-2.8-3.4-5-7.5-5z',
+  egress: 'M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm1 14.93V19h-2v-2.07A8 8 0 0 1 4.07 13H2v-2h2.07A8 8 0 0 1 11 4.07V2h2v2.07A8 8 0 0 1 19.93 11H22v2h-2.07A8 8 0 0 1 13 16.93z',
+  webapps: 'M4 4h7v7H4V4zm9 0h7v7h-7V4zM4 13h7v7H4v-7zm9 0h7v7h-7v-7z',
+  tasks: 'M4 6h16v2H4V6zm0 5h16v2H4v-2zm0 5h10v2H4v-2z',
+  studio: 'M5 4h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-5l-4 4v-4H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm1 3v6h12V7H6zm2 2 2.1 2.8 2.4-3.1L17 14H7l1-5z',
+  keys: 'M12 2a5 5 0 0 1 5 5v1h2a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1h2V7a5 5 0 0 1 5-5zm0 2a3 3 0 0 0-3 3v1h6V7a3 3 0 0 0-3-3z',
+  users: 'M16 11a3 3 0 1 0-3-3 3 3 0 0 0 3 3zm-8 0a3 3 0 1 0-3-3 3 3 0 0 0 3 3zm0 2c-2.7 0-8 1.3-8 4v2h10v-2c0-2.7-5.3-4-8-4zm8 0c-.3 0-.7 0-1 .1 1.3.9 2 2.1 2 3.9v2h7v-2c0-2.7-5.3-4-8-4z',
+  docs: 'M6 3h9l5 5v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm8 1.5V9h4.5L14 4.5zM8 12h8v2H8v-2zm0 4h8v2H8v-2z',
+  settings: 'M4 6h10v2H4V6zm12 0h4v2h-4V6zM4 11h6v2H4v-2zm8 0h8v2h-8v-2zM4 16h10v2H4v-2zm12 0h4v2h-4v-2z',
+}
+
+const menuItems = computed(() => {
+  const base = consoleBase.value
+  if (isAdmin.value) {
+    return [
+      { path: base, label: '概览中心', icon: icons.dash },
+      { path: `${base}/accounts`, label: '号池管理', icon: icons.accounts },
+      { path: `${base}/egress`, label: '出口池', icon: icons.egress },
+      { path: `${base}/webapps`, label: '应用模板', icon: icons.webapps },
+      { path: `${base}/tasks`, label: '任务队列', icon: icons.tasks },
+      { path: `${base}/studio`, label: '试跑工作室', icon: icons.studio },
+      { path: `${base}/keys`, label: 'API Key', icon: icons.keys },
+      { path: `${base}/users`, label: '用户管理', icon: icons.users },
+      { path: `${base}/docs`, label: 'API 说明', icon: icons.docs },
+      { path: `${base}/settings`, label: '系统设置', icon: icons.settings },
+    ]
+  }
+  return [
+    { path: base, label: '概览中心', icon: icons.dash },
+    { path: `${base}/accounts`, label: '号池管理', icon: icons.accounts },
+    { path: `${base}/webapps`, label: '应用模板', icon: icons.webapps },
+    { path: `${base}/tasks`, label: '任务队列', icon: icons.tasks },
+    { path: `${base}/studio`, label: '试跑工作室', icon: icons.studio },
+    { path: `${base}/keys`, label: 'API Key', icon: icons.keys },
+    { path: `${base}/docs`, label: 'API 说明', icon: icons.docs },
+    { path: `${base}/settings`, label: '设置', icon: icons.settings },
+  ]
+})
 
 const isSidebarRail = computed(() => isSidebarCollapsed.value)
 const sidebarStyle = computed(() => ({
@@ -185,7 +196,7 @@ const sidebarStyle = computed(() => ({
 }))
 
 const currentPageTitle = computed(() => {
-  const item = menuItems.find((m) => isNavActive(m.path))
+  const item = menuItems.value.find((m) => isNavActive(m.path))
   return item?.label || route.meta?.title || '概览中心'
 })
 
@@ -197,7 +208,7 @@ const themeButtonText = computed(() => {
 const themeButtonTitle = computed(() => `主题：${themeButtonText.value}`)
 
 function isNavActive(path) {
-  if (path === '/') return route.path === '/'
+  if (path === consoleBase.value) return route.path === path
   return route.path === path || route.path.startsWith(`${path}/`)
 }
 
@@ -217,10 +228,10 @@ function buildNavIconClass(path) {
 }
 
 const navItemClassMap = computed(() =>
-  Object.fromEntries(menuItems.map((item) => [item.path, buildNavItemClass(item.path)])),
+  Object.fromEntries(menuItems.value.map((item) => [item.path, buildNavItemClass(item.path)])),
 )
 const navIconClassMap = computed(() =>
-  Object.fromEntries(menuItems.map((item) => [item.path, buildNavIconClass(item.path)])),
+  Object.fromEntries(menuItems.value.map((item) => [item.path, buildNavIconClass(item.path)])),
 )
 
 function toggleSidebar() {
@@ -249,6 +260,16 @@ async function handleLogout() {
   router.push('/login')
 }
 
+async function loadMe() {
+  try {
+    const me = await api.me()
+    username.value = me?.username || ''
+    if (me?.role) setRole(me.role)
+  } catch {
+    /* ignore */
+  }
+}
+
 function onSystemThemeChange() {
   if (themeMode.value === 'system') applyThemeMode('system')
 }
@@ -258,6 +279,7 @@ onMounted(() => {
   applyThemeMode(themeMode.value)
   media = window.matchMedia('(prefers-color-scheme: dark)')
   media.addEventListener?.('change', onSystemThemeChange)
+  loadMe()
 })
 onBeforeUnmount(() => {
   media?.removeEventListener?.('change', onSystemThemeChange)

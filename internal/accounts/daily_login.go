@@ -25,17 +25,20 @@ func ShanghaiDate(t time.Time) string {
 }
 
 type DailyClaimResult struct {
-	ID        int64  `json:"id"`
-	Email     string `json:"email"`
-	OK        bool   `json:"ok"`
-	Skipped   bool   `json:"skipped,omitempty"`
-	Gained    int    `json:"gained,omitempty"`
-	Before    string `json:"before_coins,omitempty"`
-	After     string `json:"after_coins,omitempty"`
-	Triggered any    `json:"login_coin_triggered,omitempty"`
-	Day       string `json:"day,omitempty"`
-	Error     string `json:"error,omitempty"`
-	Relogged  bool   `json:"relogged,omitempty"`
+	ID             int64  `json:"id"`
+	Email          string `json:"email"`
+	OK             bool   `json:"ok"`
+	Skipped        bool   `json:"skipped,omitempty"`
+	Gained         int    `json:"gained,omitempty"`
+	Before         string `json:"before_coins,omitempty"`
+	After          string `json:"after_coins,omitempty"`
+	Triggered      any    `json:"login_coin_triggered,omitempty"`
+	BillingVersion string `json:"billing_version,omitempty"`
+	GiftAmount     string `json:"gift_amount,omitempty"`
+	AlreadyGranted bool   `json:"already_granted,omitempty"`
+	Day            string `json:"day,omitempty"`
+	Error          string `json:"error,omitempty"`
+	Relogged       bool   `json:"relogged,omitempty"`
 }
 
 type DailyLoginClaimer struct {
@@ -128,8 +131,13 @@ func (c *DailyLoginClaimer) safeRunAll() {
 // ClaimAll claims daily login coin for active accounts.
 // ids=nil means all active; force ignores last_login_coin_at skip.
 func (c *DailyLoginClaimer) ClaimAll(ids []int64, force bool) ([]DailyClaimResult, error) {
+	return c.ClaimScoped(0, ids, force)
+}
+
+// ClaimScoped claims daily login gifts. userID=0 means all users (admin/background).
+func (c *DailyLoginClaimer) ClaimScoped(userID int64, ids []int64, force bool) ([]DailyClaimResult, error) {
 	day := ShanghaiDate(time.Now())
-	list, err := c.store.ListAccounts()
+	list, err := c.store.ListAccounts(userID)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +152,8 @@ func (c *DailyLoginClaimer) ClaimAll(ids []int64, force bool) ([]DailyClaimResul
 				continue
 			}
 		}
-		if a.Status != "active" {
+		// Active accounts, or disabled only for zero balance (claim is how they refill).
+		if a.Status != "active" && !claimableNoCoins(a) {
 			continue
 		}
 		// ListAccounts strips secrets — reload full account
@@ -160,11 +169,25 @@ func (c *DailyLoginClaimer) ClaimAll(ids []int64, force bool) ([]DailyClaimResul
 	return out, nil
 }
 
+func claimableNoCoins(a store.Account) bool {
+	if a.Status != "disabled" {
+		return false
+	}
+	err := strings.TrimSpace(a.LastError)
+	return strings.HasPrefix(err, "NO_COINS")
+}
+
 func (c *DailyLoginClaimer) ClaimOne(acc store.Account, day string, force bool) DailyClaimResult {
 	res := DailyClaimResult{ID: acc.ID, Email: acc.Email, Day: day}
 	if !force && strings.TrimSpace(acc.LastLoginCoinAt) == day {
 		res.OK = true
 		res.Skipped = true
+		res.BillingVersion = strings.TrimSpace(acc.BillingVersion)
+		res.Before = firstNonEmpty(acc.RemainPoints, acc.RemainCoins)
+		// 今日已领过仍要刷新钱包，避免库里余额过期（如页面仍显示旧积分）
+		if err := c.syncWalletOnly(acc, &res); err != nil {
+			res.Error = "钱包同步失败: " + err.Error()
+		}
 		return res
 	}
 
@@ -197,78 +220,23 @@ func (c *DailyLoginClaimer) ClaimOne(acc store.Account, day string, force bool) 
 			return nil
 		}
 
-		if at == "" {
+		if at == "" || !runninghub.AccessTokenFresh(at, 24*time.Hour) {
 			if err := ensureLogin(); err != nil {
-				return err
+				if at == "" {
+					return err
+				}
+				client.SetAccessToken(at)
 			}
 		} else {
 			client.SetAccessToken(at)
 		}
-
-		uid := strings.TrimSpace(acc.RHUserID)
-		if uid == "" {
-			uid = jwtSub(at)
-			if uid != "" {
-				_ = c.store.UpdateAccountRHUserID(acc.ID, uid)
-			}
-		}
-		if uid == "" {
-			return fmt.Errorf("缺少 rh_user_id")
-		}
-
-		info, err := client.GetUserInfo(uid)
-		if err != nil {
-			if e2 := ensureLogin(); e2 != nil {
-				return err
-			}
-			if uid == "" {
-				uid = jwtSub(at)
-			}
-			info, err = client.GetUserInfo(uid)
-			if err != nil {
-				return err
-			}
-		}
-
-		before := coinFromUserInfo(info)
-		triggered := loginTriggered(info)
-		res.Before = before
-		res.Triggered = triggered
 		res.Relogged = relogged
 
-		if triggered {
-			time.Sleep(2 * time.Second)
-			if info2, e := client.GetUserInfo(uid); e == nil {
-				info = info2
-			}
-		} else {
-			time.Sleep(1200 * time.Millisecond)
-			if info2, e := client.GetUserInfo(uid); e == nil {
-				info = info2
-			}
+		// Detect billing: NEW → welfare daily-gift; OLD → legacy getUserInfo login coin.
+		if ps, e := client.PointSummary(); e == nil && runninghub.IsNewBilling(ps) {
+			return c.claimNewBilling(acc, client, &res, day, ps)
 		}
-
-		after := coinFromUserInfo(info)
-		res.After = after
-		res.Triggered = loginTriggered(info)
-		b, a := parseCoinInt(before), parseCoinInt(after)
-		if a >= b {
-			res.Gained = a - b
-		}
-		if after != "" {
-			_ = c.store.UpdateAccountBalance(acc.ID, after, acc.CurrentTaskCounts, acc.APIType)
-		} else if key := strings.TrimSpace(acc.APIKey); key != "" {
-			if st, e := client.AccountStatus(key); e == nil {
-				if data, _ := st["data"].(map[string]any); data != nil {
-					if v, ok := data["remainCoins"]; ok {
-						_ = c.store.UpdateAccountBalance(acc.ID, fmt.Sprint(v), acc.CurrentTaskCounts, acc.APIType)
-						res.After = fmt.Sprint(v)
-					}
-				}
-			}
-		}
-		_ = c.store.UpdateAccountLoginCoinAt(acc.ID, day)
-		return nil
+		return c.claimOldBilling(acc, client, &res, day, at, ensureLogin)
 	})
 	if err != nil {
 		res.Error = err.Error()
@@ -276,6 +244,195 @@ func (c *DailyLoginClaimer) ClaimOne(acc store.Account, day string, force bool) 
 	}
 	res.OK = true
 	return res
+}
+
+// syncWalletOnly refreshes RH币/积分 into DB without claiming the daily gift again.
+// Prefer API Key accountStatus so we do not burn AT/login just to refresh balance.
+func (c *DailyLoginClaimer) syncWalletOnly(acc store.Account, res *DailyClaimResult) error {
+	return c.egress.Do(acc, c.baseURL, func(client *runninghub.Client) error {
+		apiKey := strings.TrimSpace(acc.APIKey)
+		at := strings.TrimSpace(acc.AccessToken)
+
+		// Only attach existing fresh AT as fallback; never pwd-login here for wallet sync.
+		if at != "" && runninghub.AccessTokenFresh(at, 24*time.Hour) {
+			client.SetAccessToken(at)
+		} else if apiKey == "" {
+			if strings.TrimSpace(acc.Email) == "" || strings.TrimSpace(acc.Password) == "" {
+				return fmt.Errorf("缺少 API Key / 登录凭据，无法同步钱包")
+			}
+			login, err := client.PwdLogin(acc.Email, acc.Password)
+			if err != nil {
+				return err
+			}
+			token := firstNonEmpty(
+				asString(nested(login, "data", "access_token")),
+				asString(nested(login, "data", "accessToken")),
+			)
+			if token == "" {
+				return fmt.Errorf("login missing access_token")
+			}
+			rt := firstNonEmpty(
+				asString(nested(login, "data", "refresh_token")),
+				asString(nested(login, "data", "refreshToken")),
+			)
+			client.SetAccessToken(token)
+			_ = c.store.UpdateAccountAuthTokens(acc.ID, token, rt)
+		}
+
+		wallet, err := client.FetchWallet(apiKey)
+		if err != nil {
+			return err
+		}
+		res.BillingVersion = wallet.BillingVersion
+		bal := firstNonEmpty(wallet.RemainPoints, wallet.RemainCoins)
+		if strings.TrimSpace(res.Before) == "" {
+			res.Before = bal
+		}
+		res.After = bal
+		if err := c.store.UpdateAccountWallet(acc.ID, wallet.RemainCoins, wallet.RemainPoints, wallet.CurrentTaskCounts, wallet.APIType, wallet.BillingVersion); err != nil {
+			return err
+		}
+		// free quota still needs AT; only refresh when we already have one attached
+		if strings.TrimSpace(client.AccessToken) != "" {
+			RefreshFreeQuota(c.store, client, acc.ID)
+		}
+		return nil
+	})
+}
+
+func (c *DailyLoginClaimer) claimNewBilling(acc store.Account, client *runninghub.Client, res *DailyClaimResult, day string, beforePS map[string]any) error {
+	res.BillingVersion = runninghub.BillingNew
+	beforePoint, _ := runninghub.PointRemain(beforePS)
+	res.Before = beforePoint
+
+	ws, err := client.WelfareSummary(false)
+	if err != nil {
+		return err
+	}
+	granted, amount, _, ok := runninghub.DailyGiftGranted(ws)
+	if !ok {
+		return fmt.Errorf("welfare/summary missing dailyGift")
+	}
+	if granted {
+		res.AlreadyGranted = true
+		res.GiftAmount = amount
+	} else {
+		if _, err := client.ClaimDailyGift(); err != nil {
+			return err
+		}
+		time.Sleep(800 * time.Millisecond)
+		if ws2, e := client.WelfareSummary(true); e == nil {
+			if g, amt, _, ok2 := runninghub.DailyGiftGranted(ws2); ok2 {
+				granted = g
+				if amt != "" {
+					amount = amt
+				}
+			}
+		}
+		res.GiftAmount = amount
+		if !granted && amount != "" {
+			res.GiftAmount = amount
+		}
+	}
+
+	afterPoint := beforePoint
+	if ps2, e := client.PointSummary(); e == nil {
+		afterPoint, _ = runninghub.PointRemain(ps2)
+	}
+	res.After = afterPoint
+	b, a := parseCoinInt(beforePoint), parseCoinInt(afterPoint)
+	if a >= b {
+		res.Gained = a - b
+	}
+	if res.Gained == 0 && res.GiftAmount != "" && !res.AlreadyGranted {
+		res.Gained = parseCoinInt(res.GiftAmount)
+	}
+
+	wallet, _ := client.FetchWallet(acc.APIKey)
+	points := afterPoint
+	counts, apiType := acc.CurrentTaskCounts, acc.APIType
+	coins := ""
+	if wallet.BillingVersion == runninghub.BillingNew {
+		if wallet.RemainPoints != "" {
+			points = wallet.RemainPoints
+			res.After = points
+		}
+		coins = wallet.RemainCoins
+		if wallet.CurrentTaskCounts != "" {
+			counts = wallet.CurrentTaskCounts
+		}
+		if wallet.APIType != "" {
+			apiType = wallet.APIType
+		}
+	}
+	_ = c.store.UpdateAccountWallet(acc.ID, coins, points, counts, apiType, runninghub.BillingNew)
+	_ = c.store.UpdateAccountLoginCoinAt(acc.ID, day)
+	RefreshFreeQuota(c.store, client, acc.ID)
+	return nil
+}
+
+func (c *DailyLoginClaimer) claimOldBilling(acc store.Account, client *runninghub.Client, res *DailyClaimResult, day, at string, ensureLogin func() error) error {
+	res.BillingVersion = runninghub.BillingOld
+	uid := strings.TrimSpace(acc.RHUserID)
+	if uid == "" {
+		uid = jwtSub(at)
+		if uid != "" {
+			_ = c.store.UpdateAccountRHUserID(acc.ID, uid)
+		}
+	}
+	if uid == "" {
+		return fmt.Errorf("缺少 rh_user_id")
+	}
+
+	info, err := client.GetUserInfo(uid)
+	if err != nil {
+		if e2 := ensureLogin(); e2 != nil {
+			return err
+		}
+		uid = firstNonEmpty(jwtSub(client.AccessToken), uid)
+		info, err = client.GetUserInfo(uid)
+		if err != nil {
+			return err
+		}
+	}
+
+	before := coinFromUserInfo(info)
+	triggered := loginTriggered(info)
+	res.Before = before
+	res.Triggered = triggered
+
+	if triggered {
+		time.Sleep(2 * time.Second)
+	} else {
+		time.Sleep(1200 * time.Millisecond)
+	}
+	if info2, e := client.GetUserInfo(uid); e == nil {
+		info = info2
+	}
+
+	after := coinFromUserInfo(info)
+	res.After = after
+	res.Triggered = loginTriggered(info)
+	b, a := parseCoinInt(before), parseCoinInt(after)
+	if a >= b {
+		res.Gained = a - b
+	}
+	if after != "" {
+		_ = c.store.UpdateAccountBalanceWithBilling(acc.ID, after, acc.CurrentTaskCounts, acc.APIType, runninghub.BillingOld)
+	} else if key := strings.TrimSpace(acc.APIKey); key != "" {
+		if st, e := client.AccountStatus(key); e == nil {
+			if data, _ := st["data"].(map[string]any); data != nil {
+				if v, ok := data["remainCoins"]; ok {
+					_ = c.store.UpdateAccountBalanceWithBilling(acc.ID, fmt.Sprint(v), acc.CurrentTaskCounts, acc.APIType, runninghub.BillingOld)
+					res.After = fmt.Sprint(v)
+				}
+			}
+		}
+	} else {
+		_ = c.store.UpdateAccountBalanceWithBilling(acc.ID, after, acc.CurrentTaskCounts, acc.APIType, runninghub.BillingOld)
+	}
+	_ = c.store.UpdateAccountLoginCoinAt(acc.ID, day)
+	return nil
 }
 
 func coinFromUserInfo(info map[string]any) string {

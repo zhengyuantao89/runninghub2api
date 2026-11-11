@@ -13,6 +13,11 @@ const okmsg = ref('')
 const items = ref([])
 const groups = ref([])
 const groupFilter = ref('')
+const page = ref(1)
+const pageSize = ref(50)
+const total = ref(0)
+const pages = ref(0)
+const pageSizeOptions = [20, 50, 100, 200]
 const showImport = ref(false)
 const importMode = ref('text') // text | json
 const importText = ref('')
@@ -29,7 +34,12 @@ const subForm = reactive({
 })
 const subscription = ref(null)
 
-const filtered = computed(() => items.value)
+const pageRangeLabel = computed(() => {
+  if (!total.value) return '共 0 条'
+  const start = (page.value - 1) * pageSize.value + 1
+  const end = Math.min(page.value * pageSize.value, total.value)
+  return `第 ${start}-${end} 条 / 共 ${total.value} 条`
+})
 
 const importPlaceholder = computed(() =>
   importMode.value === 'text'
@@ -44,33 +54,56 @@ function statusTone(st) {
   return 'neutral'
 }
 
+function applySubscription(sub) {
+  subscription.value = sub && sub.id ? sub : null
+  if (!subscription.value) return
+  subForm.url = String(subscription.value.url || '')
+  subForm.interval_minutes = Number(subscription.value.interval_minutes) || 30
+  subForm.enabled = subscription.value.enabled !== false
+}
+
 async function load() {
   error.value = ''
   loading.value = true
   try {
     const [listRes, groupRes, subRes] = await Promise.all([
-      api.listProxies(groupFilter.value),
+      api.listProxies(groupFilter.value, page.value, pageSize.value),
       api.listProxyGroups(),
-      api.getProxySubscription().catch(() => null),
+      api.getProxySubscription(),
     ])
     items.value = Array.isArray(listRes?.items) ? listRes.items : Array.isArray(listRes) ? listRes : []
+    total.value = Number(listRes?.total) || 0
+    pages.value = Number(listRes?.pages) || 0
+    if (listRes?.page_size) pageSize.value = Number(listRes.page_size) || pageSize.value
+    const serverPage = Number(listRes?.page) || 1
+    page.value = pages.value === 0 ? 1 : Math.min(Math.max(1, serverPage), pages.value)
     groups.value = Array.isArray(groupRes) ? groupRes : []
-    if (subRes) {
-      intervals.value = Array.isArray(subRes.intervals) ? subRes.intervals : [10, 30, 60]
-      fixedGroup.value = subRes.fixed_group || 'nodes'
-      const sub = subRes.subscription || (Array.isArray(subRes.items) ? subRes.items[0] : null)
-      subscription.value = sub || null
-      if (sub) {
-        subForm.url = sub.url || ''
-        subForm.interval_minutes = sub.interval_minutes || 30
-        subForm.enabled = sub.enabled !== false
-      }
-    }
+    intervals.value = Array.isArray(subRes?.intervals) ? subRes.intervals : [10, 30, 60]
+    fixedGroup.value = subRes?.fixed_group || 'nodes'
+    const sub = subRes?.subscription || (Array.isArray(subRes?.items) ? subRes.items[0] : null)
+    applySubscription(sub)
   } catch (e) {
     error.value = e.message || String(e)
   } finally {
     loading.value = false
   }
+}
+
+function onGroupChange() {
+  page.value = 1
+  load()
+}
+
+function onPageSizeChange() {
+  page.value = 1
+  load()
+}
+
+function goPage(next) {
+  const target = Math.max(1, Math.min(pages.value || 1, Number(next) || 1))
+  if (target === page.value) return
+  page.value = target
+  load()
 }
 
 async function onSaveSubscription() {
@@ -84,7 +117,7 @@ async function onSaveSubscription() {
       enabled: !!subForm.enabled,
       refresh_now: true,
     })
-    subscription.value = res.subscription || res
+    applySubscription(res.subscription || res)
     if (res.sync_error) {
       error.value = `已保存，同步失败：${res.sync_error}`
     } else {
@@ -163,7 +196,7 @@ async function onImport() {
             ? parsed.proxies
             : null
       if (!list?.length) {
-        error.value = '需要 items/proxies 数组（gpt-plus toItem 形）'
+        error.value = '需要 items/proxies 数组'
         loading.value = false
         return
       }
@@ -247,7 +280,7 @@ onMounted(load)
         <div class="min-w-0">
           <h2 class="text-base font-semibold text-foreground">出口订阅</h2>
           <p class="mt-1.5 max-w-2xl text-xs leading-relaxed text-muted-foreground">
-            对齐 gpt-plus Nodes 订阅：填写导出 URL，定时拉取纯文本代理列表，精确同步到
+            填写导出 URL，定时拉取纯文本代理列表，精确同步到
             <code class="text-[11px]">{{ fixedGroup }}</code> 分组。
           </p>
         </div>
@@ -305,9 +338,6 @@ onMounted(load)
       <header class="flex flex-wrap items-start justify-between gap-3">
         <div class="min-w-0">
           <h2 class="text-base font-semibold text-foreground">出口池</h2>
-          <p class="mt-1.5 max-w-2xl text-xs leading-relaxed text-muted-foreground">
-            支持订阅同步、纯文本行导入（与 gpt-plus 相同格式），或 JSON toItem / 上游 push。
-          </p>
         </div>
         <div class="flex flex-wrap gap-2">
           <Button size="sm" variant="outline" :disabled="loading" @click="load">刷新</Button>
@@ -321,7 +351,7 @@ onMounted(load)
           <select
             v-model="groupFilter"
             class="rounded-lg border border-border bg-background px-2 py-1.5 text-sm text-foreground"
-            @change="load"
+            @change="onGroupChange"
           >
             <option value="">全部</option>
             <option v-for="g in groups" :key="g.group_name" :value="g.group_name">
@@ -329,6 +359,17 @@ onMounted(load)
             </option>
           </select>
         </label>
+        <label class="flex items-center gap-2 text-xs text-muted-foreground">
+          每页
+          <select
+            v-model.number="pageSize"
+            class="rounded-lg border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+            @change="onPageSizeChange"
+          >
+            <option v-for="n in pageSizeOptions" :key="n" :value="n">{{ n }}</option>
+          </select>
+        </label>
+        <span class="text-xs text-muted-foreground">{{ pageRangeLabel }}</span>
       </FilterToolbar>
 
       <p v-if="okmsg" class="mt-3 text-sm text-[hsl(var(--tone-success-strong))]">{{ okmsg }}</p>
@@ -350,7 +391,7 @@ onMounted(load)
             </tr>
           </thead>
           <tbody>
-            <tr v-for="n in filtered" :key="n.id" class="border-t border-border/70">
+            <tr v-for="n in items" :key="n.id" class="border-t border-border/70">
               <td class="py-3 pr-4 font-mono text-xs">{{ n.id }}</td>
               <td class="py-3 pr-4">{{ n.group_name || '—' }}</td>
               <td class="py-3 pr-4">
@@ -389,12 +430,24 @@ onMounted(load)
                 </div>
               </td>
             </tr>
-            <tr v-if="!loading && !filtered.length">
+            <tr v-if="!loading && !items.length">
               <td colspan="9" class="py-10 text-center text-sm text-muted-foreground">暂无出口节点</td>
             </tr>
           </tbody>
         </table>
       </TableShell>
+
+      <div class="mt-4 flex flex-wrap items-center justify-between gap-3">
+        <span class="text-xs text-muted-foreground">
+          {{ pages > 0 ? `第 ${page} / ${pages} 页` : '—' }}
+        </span>
+        <div class="flex flex-wrap items-center gap-2">
+          <Button size="sm" variant="outline" :disabled="loading || page <= 1" @click="goPage(1)">首页</Button>
+          <Button size="sm" variant="outline" :disabled="loading || page <= 1" @click="goPage(page - 1)">上一页</Button>
+          <Button size="sm" variant="outline" :disabled="loading || page >= pages" @click="goPage(page + 1)">下一页</Button>
+          <Button size="sm" variant="outline" :disabled="loading || page >= pages" @click="goPage(pages)">末页</Button>
+        </div>
+      </div>
     </PagePanel>
 
     <div
@@ -406,7 +459,7 @@ onMounted(load)
         <header>
           <h3 class="text-base font-semibold">批量导入出口</h3>
           <p class="mt-1 text-xs text-muted-foreground">
-            文本模式与 gpt-plus 相同（一行一个代理）；JSON 模式为 toItem 数组。
+            文本模式：一行一个代理；JSON 模式：items / proxies 数组。
           </p>
         </header>
         <div class="flex flex-wrap gap-2">
@@ -422,7 +475,7 @@ onMounted(load)
             :variant="importMode === 'json' ? 'primary' : 'outline'"
             @click="importMode = 'json'"
           >
-            JSON toItem
+            JSON 数组
           </Button>
         </div>
         <label v-if="importMode === 'text'" class="block space-y-1.5">

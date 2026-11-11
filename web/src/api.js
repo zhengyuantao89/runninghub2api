@@ -1,81 +1,110 @@
+import { clearRole, getRole, setRole } from './lib/auth'
+
 const KEYS = {
   session: 'rh2api.session',
   // legacy cleanup
   auth: 'rh2api.authKey',
   admin: 'rh2api.adminKey',
-};
-
-export function getSession() {
-  return localStorage.getItem(KEYS.session) || '';
 }
 
-export function setSession(token) {
-  if (token) localStorage.setItem(KEYS.session, token);
-  else localStorage.removeItem(KEYS.session);
+export function getSession() {
+  return localStorage.getItem(KEYS.session) || ''
+}
+
+export function setSession(token, role = '') {
+  if (token) localStorage.setItem(KEYS.session, token)
+  else localStorage.removeItem(KEYS.session)
+  if (role) setRole(role)
 }
 
 export function clearSession() {
-  localStorage.removeItem(KEYS.session);
-  localStorage.removeItem(KEYS.auth);
-  localStorage.removeItem(KEYS.admin);
+  localStorage.removeItem(KEYS.session)
+  localStorage.removeItem(KEYS.auth)
+  localStorage.removeItem(KEYS.admin)
+  clearRole()
 }
 
+export { getRole, setRole }
+
 async function request(path, { method = 'GET', body, formData, auth = true } = {}) {
-  const headers = {};
+  const headers = {}
   if (auth) {
-    const token = getSession();
-    if (token) headers.Authorization = `Bearer ${token}`;
+    const token = getSession()
+    if (token) headers.Authorization = `Bearer ${token}`
   }
-  let payload = body;
+  let payload = body
   if (formData) {
-    payload = formData;
+    payload = formData
   } else if (body != null) {
-    headers['Content-Type'] = 'application/json';
-    payload = JSON.stringify(body);
+    headers['Content-Type'] = 'application/json'
+    payload = JSON.stringify(body)
   }
-  const res = await fetch(path, { method, headers, body: payload });
-  const text = await res.text();
-  let data = null;
+  const res = await fetch(path, { method, headers, body: payload })
+  const text = await res.text()
+  let data = null
   try {
-    data = text ? JSON.parse(text) : null;
+    data = text ? JSON.parse(text) : null
   } catch {
-    data = { raw: text };
+    data = { raw: text }
   }
   if (!res.ok) {
-    let message = data?.error || data?.message || `HTTP ${res.status}`;
+    let message = data?.error || data?.message || `HTTP ${res.status}`
     const unauthorized =
-      res.status === 401 || /unauthorized|未登录|登录已失效/i.test(String(message));
+      res.status === 401 || /unauthorized|未登录|登录已失效/i.test(String(message))
     if (unauthorized) {
-      message = '未登录或登录已失效，请重新登录';
-      // 会话失效：清本地态并回登录页（避免停在业务页只显示红字）
+      message = '未登录或登录已失效，请重新登录'
       if (auth) {
-        clearSession();
-        const path = window.location.pathname || '';
-        if (!path.startsWith('/login')) {
-          const redirect = `${path}${window.location.search || ''}`;
-          window.location.assign(`/login?redirect=${encodeURIComponent(redirect)}`);
+        clearSession()
+        const pathNow = window.location.pathname || ''
+        if (!pathNow.startsWith('/login')) {
+          const redirect = `${pathNow}${window.location.search || ''}`
+          window.location.assign(`/login?redirect=${encodeURIComponent(redirect)}`)
         }
       }
     }
-    const err = new Error(message);
-    err.status = res.status;
-    err.data = data;
-    throw err;
+    const err = new Error(message)
+    err.status = res.status
+    err.data = data
+    throw err
   }
-  return data;
+  return data
 }
 
 export const api = {
   health: () => request('/health', { auth: false }),
   login: (username, password) =>
     request('/api/login', { method: 'POST', body: { username, password }, auth: false }),
+  register: (username, password) =>
+    request('/api/register', { method: 'POST', body: { username, password }, auth: false }),
+  registrationStatus: () => request('/api/registration', { auth: false }),
   logout: () => request('/api/logout', { method: 'POST' }),
   me: () => request('/api/me'),
   console: () => request('/api/console'),
   getSettings: () => request('/admin/settings'),
   updateSettings: (body) => request('/admin/settings', { method: 'PUT', body }),
+  updateAdminCredentials: (body) =>
+    request('/admin/credentials', { method: 'POST', body }),
 
-  listAccounts: () => request('/admin/accounts'),
+  listKeys: () => request('/api/keys'),
+  createKey: (name = '') => request('/api/keys', { method: 'POST', body: { name } }),
+  deleteKey: (id) => request(`/api/keys/${id}`, { method: 'DELETE' }),
+
+  listUsers: () => request('/admin/users'),
+  createUser: (body) => request('/admin/users', { method: 'POST', body }),
+  disableUser: (id) => request(`/admin/users/${id}/disable`, { method: 'POST' }),
+  enableUser: (id) => request(`/admin/users/${id}/enable`, { method: 'POST' }),
+  setUserPassword: (id, password) =>
+    request(`/admin/users/${id}/password`, { method: 'POST', body: { password } }),
+
+  listAccounts: (opts = {}) => {
+    const q = new URLSearchParams()
+    if (opts.page != null) q.set('page', String(opts.page))
+    if (opts.pageSize != null) q.set('page_size', String(opts.pageSize))
+    if (opts.q) q.set('q', String(opts.q))
+    if (opts.owner) q.set('owner', String(opts.owner))
+    const qs = q.toString()
+    return request(`/admin/accounts${qs ? `?${qs}` : ''}`)
+  },
   getAccount: (id) => request(`/admin/accounts/${id}`),
   createAccount: (account) => request('/admin/accounts', { method: 'POST', body: account }),
   importAccounts: (accounts) =>
@@ -105,6 +134,14 @@ export const api = {
   cancelVideo: (id) => request(`/v1/videos/${id}/cancel`, { method: 'POST' }),
   syncVideo: (id) => request(`/v1/videos/${id}/sync`, { method: 'POST' }),
   createVideoForm: (formData) => request('/v1/videos', { method: 'POST', formData }),
+  getQCCatalog: (category = 'VIDEO', { mode = '', refresh = false } = {}) => {
+    const q = new URLSearchParams()
+    if (category) q.set('category', category)
+    if (mode) q.set('mode', mode)
+    if (refresh) q.set('refresh', '1')
+    const qs = q.toString()
+    return request(`/v1/qc/catalog${qs ? `?${qs}` : ''}`)
+  },
   getWebappDemo: (webappId, { refresh = false } = {}) =>
     request(
       `/v1/webapps/${encodeURIComponent(webappId)}/demo${refresh ? '?refresh=1' : ''}`,
@@ -114,8 +151,13 @@ export const api = {
   saveTemplate: (body) => request('/admin/templates', { method: 'POST', body }),
   deleteTemplate: (id) => request(`/admin/templates/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
-  listProxies: (group = '') =>
-    request(`/admin/proxies${group ? `?group=${encodeURIComponent(group)}` : ''}`),
+  listProxies: (group = '', page = 1, pageSize = 50) => {
+    const q = new URLSearchParams()
+    if (group) q.set('group', group)
+    q.set('page', String(page || 1))
+    q.set('page_size', String(pageSize || 50))
+    return request(`/admin/proxies?${q.toString()}`)
+  },
   listProxyGroups: () => request('/admin/proxies/groups'),
   importProxies: (items, source = 'manual') =>
     request('/admin/proxies/import', { method: 'POST', body: { items, source } }),
@@ -138,4 +180,4 @@ export const api = {
   enableProxy: (id) => request(`/admin/proxies/${id}/enable`, { method: 'POST' }),
   disableProxy: (id) => request(`/admin/proxies/${id}/disable`, { method: 'POST' }),
   testProxy: (id) => request(`/admin/proxies/${id}/test`, { method: 'POST' }),
-};
+}

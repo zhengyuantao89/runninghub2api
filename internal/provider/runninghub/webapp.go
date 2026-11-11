@@ -37,6 +37,19 @@ type RunInput struct {
 	WebappID        string
 	Duration        string
 	AspectRatio     string
+	// Resolution for QC free path: 480p / 768p / 1080p / 1k…
+	Resolution string
+	// FirstFrameURL when set, QC free path skips COS upload and uses this CDN URL.
+	FirstFrameURL string
+	// Generic QC model selection (submit_mode=qc).
+	BindingID    string
+	SkuID        string
+	CategoryID   string
+	CreationMode string // MULTIMODAL_REFERENCE / FREE_CREATION / …
+	// QCParams merged into createRequest.params (after upload URL injection).
+	QCParams map[string]any
+	// AllowPaid permits non-free fee-preview (account points). Default false for qc_free*.
+	AllowPaid bool
 	// NodeInfoList when set, bypasses the hardcoded default-app mapping.
 	NodeInfoList []NodeInput
 	// ExtraImages maps nodeId (or "default") -> local image bytes for IMAGE fields.
@@ -58,7 +71,11 @@ type Progress struct {
 	QueueCount   int
 	ProgressText string
 	AccessToken  string
+	RefreshToken string
 }
+
+// atRefreshSkew: re-login this long before JWT exp to avoid mid-submit expiry.
+const atRefreshSkew = 24 * time.Hour
 
 type RunResult struct {
 	TaskID      string `json:"task_id"`
@@ -71,11 +88,12 @@ type RunResult struct {
 	AccessToken string `json:"-"`
 }
 
-// Session holds auth + RH task id after SubmitWebappVideo succeeds.
+// Session holds auth + RH task id after SubmitWebappVideo / SubmitQCFreeVideo succeeds.
 type Session struct {
 	Client   *Client
 	TaskID   string
 	WebappID string
+	Kind     string // webapp | qc
 }
 
 func RunWebappVideo(in RunInput) (*RunResult, error) {
@@ -104,15 +122,21 @@ func loginClient(in RunInput) (*Client, error) {
 	}
 	client.ApplyIdentity(in.AnonymousID, in.FingerprintJSON)
 
-	// 提交 /task/webapp/create 走 Bearer AT。已有 AT 时绝不再 PwdLogin，
-	// 否则会打爆 RH 登录限流（FREQUENT_OPER）并把号误冷却。
-	if at := strings.TrimSpace(in.AccessToken); at != "" {
+	at := strings.TrimSpace(in.AccessToken)
+	// Fresh AT: use as-is (avoid FREQUENT_OPER from needless pwdLogin).
+	if AccessTokenFresh(at, atRefreshSkew) {
 		client.SetAccessToken(at)
 		return client, nil
 	}
+	// Missing/near-expiry: refresh via pwdLogin when password is available.
 	if strings.TrimSpace(in.Email) != "" && strings.TrimSpace(in.Password) != "" {
 		login, err := client.PwdLogin(in.Email, in.Password)
 		if err != nil {
+			// Stale AT still better than failing hard if login is rate-limited.
+			if at != "" {
+				client.SetAccessToken(at)
+				return client, nil
+			}
 			return nil, err
 		}
 		token := asString(nested(login, "data", "access_token"))
@@ -120,9 +144,24 @@ func loginClient(in RunInput) (*Client, error) {
 			token = asString(nested(login, "data", "accessToken"))
 		}
 		if token == "" {
+			if at != "" {
+				client.SetAccessToken(at)
+				return client, nil
+			}
 			return nil, fmt.Errorf("login missing access_token")
 		}
+		rt := firstNonEmpty(
+			asString(nested(login, "data", "refresh_token")),
+			asString(nested(login, "data", "refreshToken")),
+		)
 		client.SetAccessToken(token)
+		if in.OnProgress != nil {
+			in.OnProgress(Progress{AccessToken: token, RefreshToken: rt})
+		}
+		return client, nil
+	}
+	if at != "" {
+		client.SetAccessToken(at)
 		return client, nil
 	}
 	return nil, fmt.Errorf("email+password or access_token required")
@@ -139,6 +178,21 @@ func loadDefaultImage(in RunInput) ([]byte, string, error) {
 		img = b
 		if filename == "" {
 			filename = filepath.Base(in.ImagePath)
+		}
+	}
+	if len(img) == 0 && len(in.ExtraImages) > 0 {
+		if b := in.ExtraImages["default"]; len(b) > 0 {
+			img = b
+		} else {
+			for _, b := range in.ExtraImages {
+				if len(b) > 0 {
+					img = b
+					break
+				}
+			}
+		}
+		if filename == "" {
+			filename = "image.png"
 		}
 	}
 	if filename == "" {
@@ -226,7 +280,7 @@ func SubmitWebappVideo(in RunInput) (*Session, error) {
 		return nil, fmt.Errorf("create missing taskId")
 	}
 	emit(Progress{TaskID: taskID, RHStatus: "QUEUED", ProgressText: "已提交 RH，等待排队"})
-	return &Session{Client: client, TaskID: taskID, WebappID: webappID}, nil
+	return &Session{Client: client, TaskID: taskID, WebappID: webappID, Kind: SessionKindWebapp}, nil
 }
 
 func buildLegacyInputs(client *Client, in RunInput, webappID string) ([]map[string]any, error) {
@@ -471,6 +525,9 @@ func buildDemoPayload(webappID, name, description string, nodesRaw []any, source
 func (s *Session) Poll(in RunInput) (*RunResult, error) {
 	if s == nil || s.Client == nil || s.TaskID == "" {
 		return nil, fmt.Errorf("invalid session")
+	}
+	if s.Kind == SessionKindQC || IsQCWebappID(s.WebappID) {
+		return PollQC(s.Client, s.TaskID, in)
 	}
 	webappID := s.WebappID
 	if webappID == "" {

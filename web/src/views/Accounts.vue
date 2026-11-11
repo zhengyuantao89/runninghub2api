@@ -1,12 +1,20 @@
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { Button, Input, ModalShell } from 'nanocat-ui'
 import FilterToolbar from '@/components/ai/FilterToolbar.vue'
 import MetricStrip from '@/components/ai/MetricStrip.vue'
 import PagePanel from '@/components/ai/PagePanel.vue'
 import TableShell from '@/components/ai/TableShell.vue'
 import TonePill from '@/components/TonePill.vue'
-import { api } from '@/api'
+import { api, getRole } from '@/api'
+import { consoleBaseFromPath, isAdminRole } from '@/lib/auth'
+import { copyText } from '@/lib/copyText'
+import { logClaimResponse, runLog } from '@/lib/runLog'
+
+const route = useRoute()
+const isAdmin = computed(() => isAdminRole(getRole()) || consoleBaseFromPath(route.path) === '/admin')
+const ownerFilter = ref('')
 
 const rows = ref([])
 const error = ref('')
@@ -17,7 +25,14 @@ const batchBusy = ref(false)
 const showImport = ref(false)
 const showAdd = ref(false)
 const keyword = ref('')
+const page = ref(1)
+const pageSize = ref(50)
+const total = ref(0)
+const pages = ref(0)
+const pageSizeOptions = [50, 100, 200]
+const ownerNames = ref([])
 const busyId = ref(0)
+let keywordTimer = 0
 const actionMenuId = ref(0)
 const actionMenuStyle = ref({})
 const actionMenuRow = ref(null)
@@ -28,6 +43,8 @@ const detailMaxConcurrency = ref(1)
 const savingConcurrency = ref(false)
 const headerCheckEl = ref(null)
 const toolbarButtonClass = 'h-8 justify-center px-3 text-xs'
+const copiedKey = ref('')
+let copiedTimer = 0
 
 function placeActionMenu(anchorEl) {
   if (!anchorEl?.getBoundingClientRect) {
@@ -81,7 +98,9 @@ async function runRowAction(row, action) {
   if (action === 'detail') return openDetail(row)
   if (action === 'ensureKey') return ensureKeyOne(row)
   if (action === 'refresh') return refreshOne(row)
+  if (action === 'claim') return claimOne(row)
   if (action === 'toggleStatus') return toggleStatus(row)
+  if (action === 'delete') return deleteOne(row)
 }
 
 const addForm = reactive({
@@ -103,21 +122,26 @@ const metricItems = computed(() => {
   const cooldown = list.filter((x) => x.cooldown_until).length
   const failed = list.filter((x) => Number(x.fail_count || 0) > 0).length
   return [
-    { key: 'total', label: '号池总数', value: list.length },
-    { key: 'active', label: '可调度', value: active },
-    { key: 'busy', label: '占用中', value: busy },
-    { key: 'cool', label: '冷却中', value: cooldown },
-    { key: 'fail', label: '有失败记录', value: failed },
+    { key: 'total', label: '号池总数', value: total.value },
+    { key: 'active', label: '本页可调度', value: active },
+    { key: 'busy', label: '本页占用', value: busy },
+    { key: 'cool', label: '本页冷却', value: cooldown },
+    { key: 'fail', label: '本页有失败', value: failed },
   ]
 })
 
-const filtered = computed(() => {
-  const q = keyword.value.trim().toLowerCase()
-  if (!q) return rows.value
-  return rows.value.filter((a) =>
-    [a.id, a.email, a.status, a.source, a.api_type].join(' ').toLowerCase().includes(q),
-  )
+const ownerOptions = computed(() =>
+  [...ownerNames.value].sort((a, b) => a.localeCompare(b, 'zh-CN')),
+)
+
+const pageRangeLabel = computed(() => {
+  if (!total.value) return '共 0 条'
+  const start = (page.value - 1) * pageSize.value + 1
+  const end = Math.min(page.value * pageSize.value, total.value)
+  return `第 ${start}-${end} 条 / 共 ${total.value} 条`
 })
+
+const filtered = computed(() => rows.value || [])
 
 const filteredIds = computed(() => filtered.value.map((a) => a.id))
 
@@ -143,11 +167,17 @@ const detailFields = computed(() => {
   const dash = (v) => (v == null || v === '' ? '—' : String(v))
   return [
     { label: 'ID', value: dash(a.id), copy: true, mono: true },
+    { label: '归属用户', value: dash(a.owner || (a.user_id ? `#${a.user_id}` : '')) },
     { label: '邮箱', value: dash(a.email), copy: true },
     { label: '状态', value: dash(a.status) },
     { label: '可调度', value: a.dispatchable ? '是' : '否' },
     { label: '占用中', value: a.busy ? '是' : '否' },
+    { label: '计费体系', value: dash(a.billing_version || 'OLD') },
     { label: 'RH 币', value: dash(a.remain_coins) },
+    { label: '积分', value: dash(a.remain_points) },
+    { label: '图片', value: freeQuotaLabel(a.free_image_remaining, a.free_image_total) },
+    { label: '视频', value: freeQuotaLabel(a.free_video_remaining, a.free_video_total) },
+    { label: '免费额度时间', value: dash(a.last_free_quota_at), mono: true },
     { label: '并发上限', value: dash(a.max_concurrency || 1) },
     { label: '本网关在途', value: `${a.inflight || 0} / ${a.max_concurrency || 1}` },
     { label: 'RH 在途', value: dash(a.current_task_counts || '0') },
@@ -162,7 +192,7 @@ const detailFields = computed(() => {
     { label: '冷却至', value: dash(a.cooldown_until), mono: true },
     { label: '失败次数', value: dash(a.fail_count ?? 0) },
     { label: '最近余额时间', value: dash(a.last_balance_at), mono: true },
-    { label: '每日积分领取日', value: dash(a.last_login_coin_at), mono: true },
+    { label: '每日领取日', value: dash(a.last_login_coin_at), mono: true },
     { label: 'Lease Task', value: dash(a.lease_task_id), mono: true, copy: !!a.lease_task_id },
     { label: 'Lease Until', value: dash(a.lease_until), mono: true },
     { label: '创建时间', value: dash(a.created_at), mono: true },
@@ -218,14 +248,67 @@ function selectedRows() {
   return filtered.value.filter((a) => selectedIds.value.has(a.id))
 }
 
+async function loadOwners() {
+  if (!isAdmin.value) {
+    ownerNames.value = []
+    return
+  }
+  try {
+    const res = await api.listUsers()
+    const list = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : []
+    ownerNames.value = list.map((u) => String(u.username || '').trim()).filter(Boolean)
+  } catch {
+    ownerNames.value = []
+  }
+}
+
 async function refresh() {
   error.value = ''
+  loading.value = true
   try {
-    const res = await api.listAccounts()
+    const res = await api.listAccounts({
+      page: page.value,
+      pageSize: pageSize.value,
+      q: keyword.value.trim(),
+      owner: ownerFilter.value.trim(),
+    })
     rows.value = res.data || []
+    total.value = Number(res.total) || 0
+    pages.value = Number(res.pages) || 0
+    if (res.page_size) pageSize.value = Number(res.page_size) || pageSize.value
+    const serverPage = Number(res.page) || 1
+    page.value = pages.value === 0 ? 1 : Math.min(Math.max(1, serverPage), pages.value)
   } catch (e) {
     error.value = e.message || String(e)
+  } finally {
+    loading.value = false
   }
+}
+
+function onPageSizeChange() {
+  page.value = 1
+  refresh()
+}
+
+function onOwnerChange() {
+  page.value = 1
+  refresh()
+}
+
+function onKeywordInput(v) {
+  keyword.value = String(v ?? '')
+  if (keywordTimer) clearTimeout(keywordTimer)
+  keywordTimer = setTimeout(() => {
+    page.value = 1
+    refresh()
+  }, 300)
+}
+
+function goPage(next) {
+  const target = Math.max(1, Math.min(pages.value || 1, Number(next) || 1))
+  if (target === page.value) return
+  page.value = target
+  refresh()
 }
 
 async function doAdd() {
@@ -329,6 +412,31 @@ async function toggleStatus(row) {
   }
 }
 
+async function deleteOne(row) {
+  if (!row?.id) return
+  if (!window.confirm(`确定删除账号 ${row.email || row.id}？此操作会直接从数据库删除，不可恢复。`)) {
+    return
+  }
+  error.value = ''
+  busyId.value = row.id
+  runLog.info(`正在删除 ${row.email || row.id}…`)
+  try {
+    await api.deleteAccount(row.id)
+    if (detail.value?.id === row.id) closeDetail()
+    const next = new Set(selectedIds.value)
+    next.delete(row.id)
+    selectedIds.value = next
+    await refresh()
+    runLog.success(`${row.email || row.id} 已删除`)
+  } catch (e) {
+    const msg = e.message || String(e)
+    runLog.error(`${row.email || row.id} 删除失败：${msg}`)
+    error.value = msg
+  } finally {
+    busyId.value = 0
+  }
+}
+
 async function runBatch(label, worker) {
   const list = selectedRows()
   if (!list.length) {
@@ -380,29 +488,50 @@ async function batchRefresh() {
   await runBatch('批量刷新', (row) => api.refreshAccount(row.id))
 }
 
+async function claimOne(row) {
+  if (!row?.id) return
+  error.value = ''
+  busyId.value = row.id
+  runLog.info(`开始给 ${row.email} 领今日积分…`)
+  try {
+    const res = await api.claimDailyLogin([row.id], false)
+    logClaimResponse(res, { emailHint: row.email })
+    await refresh()
+    if (detail.value?.id === row.id) {
+      detail.value = await api.getAccount(row.id)
+    }
+  } catch (e) {
+    const msg = e.message || String(e)
+    runLog.error(`${row.email} 领取出错了：${msg}`)
+    error.value = msg
+  } finally {
+    busyId.value = 0
+  }
+}
+
 async function batchClaimDailyLogin() {
   const list = selectedRows()
   const ids = list.map((r) => r.id)
   const scope = ids.length ? `选中的 ${ids.length} 个账号` : '全部活跃账号'
-  if (!window.confirm(`用已保存 AT 调用 getUserInfo 领取今日登录积分（${scope}）？`)) {
+  if (!window.confirm(`领取今日积分（${scope}；含因积分为 0 被禁用的号）？`)) {
     return
   }
   error.value = ''
   okmsg.value = ''
   batchBusy.value = true
+  runLog.info(`开始批量领积分啦（${scope}）…`)
   try {
     const res = await api.claimDailyLogin(ids, false)
+    logClaimResponse(res)
     await refresh()
-    okmsg.value = `每日积分 ${res.day || ''}：成功 ${res.success || 0}，跳过 ${res.skipped || 0}，失败 ${res.failed || 0}，合计 +${res.gained || 0}`
-    if (Number(res.failed || 0) > 0) {
-      const fails = (res.results || [])
-        .filter((x) => !x.ok && !x.skipped)
-        .slice(0, 5)
-        .map((x) => `${x.email || x.id}: ${x.error}`)
-      error.value = fails.join('；')
+    const total = Number(res.success || 0) + Number(res.skipped || 0) + Number(res.failed || 0)
+    if (total === 0) {
+      runLog.warning('没有可领的号（要 active，或者因没币被禁但仍有 AT/密码）')
     }
   } catch (e) {
-    error.value = e.message || String(e)
+    const msg = e.message || String(e)
+    runLog.error(`批量领取整组翻车了：${msg}`)
+    error.value = msg
   } finally {
     batchBusy.value = false
   }
@@ -508,8 +637,36 @@ async function saveDetailConcurrency() {
   }
 }
 
-function copy(text) {
-  navigator.clipboard?.writeText(text || '')
+async function copy(text, key = '') {
+  const value = String(text ?? '').trim()
+  if (!value || value === '—') {
+    error.value = '没有可复制的内容'
+    return
+  }
+  try {
+    await copyText(value)
+    error.value = ''
+    if (key) {
+      copiedKey.value = key
+      window.clearTimeout(copiedTimer)
+      copiedTimer = window.setTimeout(() => {
+        if (copiedKey.value === key) copiedKey.value = ''
+      }, 1500)
+    } else {
+      okmsg.value = '已复制'
+      window.setTimeout(() => {
+        if (okmsg.value === '已复制') okmsg.value = ''
+      }, 1200)
+    }
+  } catch {
+    error.value = '复制失败，请手动选中后复制'
+  }
+}
+
+function freeQuotaLabel(remaining, total) {
+  const t = Number(total || 0)
+  if (!t) return '—'
+  return `${Number(remaining || 0)}/${t}`
 }
 
 function statusTone(status) {
@@ -566,10 +723,12 @@ onMounted(() => {
   document.addEventListener('click', onDocClick)
   window.addEventListener('resize', onActionMenuReposition)
   window.addEventListener('scroll', onActionMenuReposition, true)
+  loadOwners()
   refresh()
 })
 
 onUnmounted(() => {
+  if (keywordTimer) clearTimeout(keywordTimer)
   document.removeEventListener('click', onDocClick)
   window.removeEventListener('resize', onActionMenuReposition)
   window.removeEventListener('scroll', onActionMenuReposition, true)
@@ -586,15 +745,35 @@ onUnmounted(() => {
           <Input
             :model-value="keyword"
             type="text"
-            placeholder="搜索邮箱 / ID / 状态 / 来源"
+            :placeholder="isAdmin ? '搜索邮箱 / ID / 状态 / 来源' : '搜索邮箱 / ID / 状态 / 来源'"
             block
             root-class="min-w-[14rem] flex-1 md:max-w-sm"
-            @update:model-value="keyword = String($event ?? '').trim()"
+            @update:model-value="onKeywordInput"
           />
+          <select
+            v-if="isAdmin"
+            v-model="ownerFilter"
+            class="h-9 rounded-xl border border-border bg-background px-3 text-sm text-foreground"
+            @change="onOwnerChange"
+          >
+            <option value="">全部用户</option>
+            <option v-for="name in ownerOptions" :key="name" :value="name">{{ name }}</option>
+          </select>
+          <label class="flex items-center gap-2 text-xs text-muted-foreground">
+            每页
+            <select
+              v-model.number="pageSize"
+              class="h-9 rounded-xl border border-border bg-background px-2 text-sm text-foreground"
+              @change="onPageSizeChange"
+            >
+              <option v-for="n in pageSizeOptions" :key="n" :value="n">{{ n }}</option>
+            </select>
+          </label>
+          <span class="text-xs text-muted-foreground">{{ pageRangeLabel }}</span>
         </FilterToolbar>
         <div class="flex flex-wrap items-center justify-between gap-3">
           <p class="text-xs text-muted-foreground">
-            共 {{ filtered.length }} 个账号 · 已选 {{ selectedCount }} · 并发可在详情按号设置（默认 1）
+            共 {{ total }} 个账号 · 已选 {{ selectedCount }} · 并发可在详情按号设置（默认 1）
           </p>
           <div class="flex flex-wrap gap-2">
             <Button
@@ -684,11 +863,16 @@ onUnmounted(() => {
                 />
               </th>
               <th class="py-3 pr-5">账号</th>
+              <th v-if="isAdmin" class="py-3 pr-5">归属</th>
               <th class="py-3 px-3 text-center">Token</th>
               <th class="py-3 pr-5">状态</th>
               <th class="py-3 pr-5">可调度</th>
+              <th class="py-3 pr-5">体系</th>
               <th class="py-3 pr-5">RH币</th>
-              <th class="py-3 pr-5">每日积分</th>
+              <th class="py-3 pr-5">积分</th>
+              <th class="py-3 pr-5">图片</th>
+              <th class="py-3 pr-5">视频</th>
+              <th class="py-3 pr-5">领取日</th>
               <th class="py-3 pr-5">指纹</th>
               <th class="py-3 px-3 text-center">出口</th>
               <th class="py-3 px-3 text-center">并发</th>
@@ -714,10 +898,14 @@ onUnmounted(() => {
                 <button
                   type="button"
                   class="text-left font-medium text-foreground hover:underline"
-                  @click="copy(a.email)"
+                  @click="copy(a.email, `email-${a.id}`)"
                 >
-                  {{ a.email }}
+                  {{ copiedKey === `email-${a.id}` ? '已复制' : a.email }}
                 </button>
+              </td>
+              <td v-if="isAdmin" class="py-3 pr-5">
+                <span v-if="a.owner" class="text-sm text-foreground">{{ a.owner }}</span>
+                <span v-else class="text-muted-foreground">—</span>
               </td>
               <td class="px-3 py-3 text-center">
                 <div class="inline-flex flex-wrap justify-center gap-1">
@@ -731,7 +919,11 @@ onUnmounted(() => {
               <td class="py-3 pr-5">
                 <TonePill :tone="dispatchTone(a)" :label="dispatchLabel(a)" />
               </td>
+              <td class="py-3 pr-5 font-mono text-xs">{{ a.billing_version || 'OLD' }}</td>
               <td class="py-3 pr-5">{{ a.remain_coins || '—' }}</td>
+              <td class="py-3 pr-5">{{ a.remain_points || '—' }}</td>
+              <td class="py-3 pr-5 font-mono text-xs">{{ freeQuotaLabel(a.free_image_remaining, a.free_image_total) }}</td>
+              <td class="py-3 pr-5 font-mono text-xs">{{ freeQuotaLabel(a.free_video_remaining, a.free_video_total) }}</td>
               <td class="py-3 pr-5 font-mono text-xs text-muted-foreground">{{ a.last_login_coin_at || '—' }}</td>
               <td class="py-3 pr-5">
                 <TonePill
@@ -766,14 +958,26 @@ onUnmounted(() => {
                 </Button>
               </td>
             </tr>
-            <tr v-if="!filtered.length">
-              <td colspan="16" class="py-8 text-center text-sm text-muted-foreground">
+            <tr v-if="!loading && !filtered.length">
+              <td colspan="21" class="py-8 text-center text-sm text-muted-foreground">
                 暂无账号。可单独添加、批量导入，或通过推送接口同步。
               </td>
             </tr>
           </tbody>
         </table>
       </TableShell>
+
+      <div class="mt-4 flex flex-wrap items-center justify-between gap-3">
+        <span class="text-xs text-muted-foreground">
+          {{ pages > 0 ? `第 ${page} / ${pages} 页` : '—' }}
+        </span>
+        <div class="flex flex-wrap items-center gap-2">
+          <Button size="sm" variant="outline" :disabled="loading || page <= 1" @click="goPage(1)">首页</Button>
+          <Button size="sm" variant="outline" :disabled="loading || page <= 1" @click="goPage(page - 1)">上一页</Button>
+          <Button size="sm" variant="outline" :disabled="loading || page >= pages" @click="goPage(page + 1)">下一页</Button>
+          <Button size="sm" variant="outline" :disabled="loading || page >= pages" @click="goPage(pages)">末页</Button>
+        </div>
+      </div>
 
       <Teleport to="body">
         <div
@@ -810,9 +1014,25 @@ onUnmounted(() => {
             type="button"
             class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
             :disabled="busyId === actionMenuRow.id || batchBusy"
+            @click="runRowAction(actionMenuRow, 'claim')"
+          >
+            领取积分
+          </button>
+          <button
+            type="button"
+            class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
+            :disabled="busyId === actionMenuRow.id || batchBusy"
             @click="runRowAction(actionMenuRow, 'toggleStatus')"
           >
             {{ actionMenuRow.status === 'active' ? '禁用' : '启用' }}
+          </button>
+          <button
+            type="button"
+            class="block w-full px-3 py-1.5 text-left text-xs text-[hsl(var(--tone-error-strong))] hover:bg-muted/60"
+            :disabled="busyId === actionMenuRow.id || batchBusy"
+            @click="runRowAction(actionMenuRow, 'delete')"
+          >
+            删除
           </button>
         </div>
       </Teleport>
@@ -974,8 +1194,8 @@ onUnmounted(() => {
                 v-if="f.copy && f.value && f.value !== '—'"
                 type="button"
                 class="ml-2 text-xs text-muted-foreground hover:text-foreground"
-                @click="copy(f.value)"
-              >复制</button>
+                @click="copy(f.value, f.label)"
+              >{{ copiedKey === f.label ? '已复制' : '复制' }}</button>
             </dd>
           </div>
         </dl>

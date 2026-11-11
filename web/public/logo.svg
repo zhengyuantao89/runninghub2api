@@ -5,7 +5,7 @@
         --primary-ink: #2c3e50;
         --soul-color: #00bcd4;
       }
-      .logo-cat-wrapper {
+      .logo-dog-wrapper {
         animation: logo-float 4s ease-in-out infinite;
         transform-origin: center;
       }
@@ -33,20 +33,24 @@
     </filter>
   </defs>
 
-  <g class="logo-cat-wrapper" transform="translate(0, 12)">
-    <g transform="translate(16, 20) rotate(-10, 9, 12)">
-      <path d="M14 0 L18 24 L0 24 Z" fill="#2c3e50" />
-    </g>
-    <g transform="translate(96, 20) rotate(10, 9, 12)">
-      <path d="M4 0 L18 24 L0 24 Z" fill="#2c3e50" />
-    </g>
+  <g class="logo-dog-wrapper" transform="translate(0, 12)">
+    <!-- Floppy ears (dog), not pointed (cat) -->
+    <path d="M8 38 C0 30 -2 52 6 78 C10 92 28 94 30 74 C31 58 22 44 8 38Z" fill="#2c3e50"/>
+    <path d="M122 38 C130 30 132 52 124 78 C120 92 102 94 100 74 C99 58 108 44 122 38Z" fill="#2c3e50"/>
+    <path d="M12 48 C8 56 10 72 14 80 C18 76 20 58 16 52Z" fill="#3d566e"/>
+    <path d="M118 48 C122 56 120 72 116 80 C112 76 110 58 114 52Z" fill="#3d566e"/>
+
     <g filter="url(#head-shadow)">
-      <path d="M 32 40 L 98 40 A 12 12 0 0 1 110 52 L 110 90 A 30 30 0 0 1 80 120 L 50 120 A 30 30 0 0 1 20 90 L 20 52 A 12 12 0 0 1 32 40 Z"
-        fill="rgba(255, 255, 255, 0.9)"
+      <path
+        d="M 32 40 L 98 40 A 12 12 0 0 1 110 52 L 110 90 A 30 30 0 0 1 80 120 L 50 120 A 30 30 0 0 1 20 90 L 20 52 A 12 12 0 0 1 32 40 Z"
+        fill="rgba(255, 255, 255, 0.95)"
         stroke="#2c3e50"
         stroke-width="3"
       />
+      <ellipse cx="65" cy="92" rx="6" ry="4.5" fill="#2c3e50"/>
+      <path d="M48 98 Q65 116 82 98" fill="none" stroke="#2c3e50" stroke-width="3" stroke-linecap="round"/>
     </g>
+
     <rect class="logo-eye" x="35" y="68" width="14" height="4" rx="1" />
     <rect class="logo-eye" x="81" y="68" width="14" height="4" rx="1" />
   </g>

@@ -24,14 +24,17 @@ func New(s *store.Store, submitGap time.Duration) *Pool {
 	return &Pool{store: s, submitGap: submitGap}
 }
 
-func (p *Pool) Acquire(taskID string) (store.Account, error) {
+func (p *Pool) Acquire(userID int64, taskID string) (store.Account, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	accounts, err := p.store.ListDispatchableAccounts(p.submitGap)
+	accounts, err := p.store.ListDispatchableAccounts(userID, p.submitGap)
 	if err != nil {
 		return store.Account{}, err
 	}
 	for _, a := range accounts {
+		if userID > 0 && a.UserID != userID {
+			continue
+		}
 		if err := p.store.LeaseAccount(a.ID, taskID, 30*time.Minute); err != nil {
 			continue
 		}

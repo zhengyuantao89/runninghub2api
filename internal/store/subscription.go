@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// EgressSubscription mirrors gpt-plus proxy_subscriptions (single-tenant).
+// EgressSubscription is the single-tenant proxy subscription row.
 type EgressSubscription struct {
 	ID              int64  `json:"id"`
 	Name            string `json:"name"`

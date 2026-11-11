@@ -47,7 +47,7 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
-// ApplyIdentity sets anonymous_id + browser fingerprint headers from gpt-plus push payload.
+// ApplyIdentity sets anonymous_id + browser fingerprint headers from push payload.
 func (c *Client) ApplyIdentity(anonymousID, fingerprintJSON string) {
 	if id := strings.TrimSpace(anonymousID); id != "" {
 		c.AnonymousID = id
@@ -168,6 +168,21 @@ func (c *Client) PwdLogin(email, passwordPlain string) (map[string]any, error) {
 
 func (c *Client) GetUserInfo(userID string) (map[string]any, error) {
 	return c.postJSON("/uc/getUserInfo", map[string]any{"userId": userID})
+}
+
+// PointSummary is the NEW billing wallet snapshot (billingVersion / balancePoint).
+func (c *Client) PointSummary() (map[string]any, error) {
+	return c.postJSON("/uc/point/summary", map[string]any{})
+}
+
+// WelfareSummary returns daily gift / free quota status. issue=true refreshes after claim.
+func (c *Client) WelfareSummary(issue bool) (map[string]any, error) {
+	return c.postJSON("/api/welfare/summary", map[string]any{"issue": issue})
+}
+
+// ClaimDailyGift claims NEW-system daily points (POST /api/welfare/daily-gift/claim).
+func (c *Client) ClaimDailyGift() (map[string]any, error) {
+	return c.postJSON("/api/welfare/daily-gift/claim", map[string]any{})
 }
 
 // CreateConsumerApiKey needs JWT; allowCodes includes 301 (already exists).
@@ -550,10 +565,10 @@ func (c *Client) UploadImage(data []byte, filename, webappID string) (map[string
 	return decoded, nil
 }
 
-func DecodeJWTSub(token string) string {
+func decodeJWTClaims(token string) map[string]any {
 	parts := strings.Split(token, ".")
 	if len(parts) < 2 {
-		return ""
+		return nil
 	}
 	payload := parts[1]
 	if m := len(payload) % 4; m != 0 {
@@ -563,17 +578,72 @@ func DecodeJWTSub(token string) string {
 	if err != nil {
 		raw, err = base64.RawURLEncoding.DecodeString(parts[1])
 		if err != nil {
-			return ""
+			return nil
 		}
 	}
 	var m map[string]any
 	if json.Unmarshal(raw, &m) != nil {
+		return nil
+	}
+	return m
+}
+
+func DecodeJWTSub(token string) string {
+	m := decodeJWTClaims(token)
+	if m == nil {
 		return ""
 	}
 	if s := asString(m["sub"]); s != "" {
 		return s
 	}
 	return asString(m["userId"])
+}
+
+// DecodeJWTExp returns the JWT exp claim as UTC time, or zero if missing/invalid.
+func DecodeJWTExp(token string) time.Time {
+	m := decodeJWTClaims(token)
+	if m == nil {
+		return time.Time{}
+	}
+	switch v := m["exp"].(type) {
+	case float64:
+		if v <= 0 {
+			return time.Time{}
+		}
+		return time.Unix(int64(v), 0).UTC()
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil || n <= 0 {
+			return time.Time{}
+		}
+		return time.Unix(n, 0).UTC()
+	case string:
+		n, err := json.Number(v).Int64()
+		if err != nil || n <= 0 {
+			return time.Time{}
+		}
+		return time.Unix(n, 0).UTC()
+	default:
+		return time.Time{}
+	}
+}
+
+// AccessTokenFresh is true when token is present and either has no exp claim
+// (non-JWT / unknown) or expires after now+skew. Missing exp is treated as
+// usable to avoid login storms on opaque tokens.
+func AccessTokenFresh(token string, skew time.Duration) bool {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return false
+	}
+	exp := DecodeJWTExp(token)
+	if exp.IsZero() {
+		return true
+	}
+	if skew < 0 {
+		skew = 0
+	}
+	return time.Now().UTC().Add(skew).Before(exp)
 }
 
 func guessContentType(name string) string {

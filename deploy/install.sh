@@ -18,8 +18,13 @@ if [[ -d ./web/dist ]]; then
   rm -rf "$APP_DIR/web/dist"
   cp -a ./web/dist "$APP_DIR/web/dist"
 fi
+# 已有 .env 不覆盖，避免部署把后台改过的管理员相关配置回写掉
 if [[ -f ./.env ]]; then
-  install -m 0600 ./.env "$APP_DIR/.env"
+  if [[ -f "$APP_DIR/.env" ]]; then
+    echo "keep existing $APP_DIR/.env (not overwritten by release)"
+  else
+    install -m 0600 ./.env "$APP_DIR/.env"
+  fi
 fi
 
 chown -R rh2api:rh2api "$APP_DIR"

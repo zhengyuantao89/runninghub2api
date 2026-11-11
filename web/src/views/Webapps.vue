@@ -1,14 +1,18 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { Button, Input, ModalShell } from 'nanocat-ui'
 import PagePanel from '@/components/ai/PagePanel.vue'
 import TableShell from '@/components/ai/TableShell.vue'
 import TonePill from '@/components/TonePill.vue'
-import { api } from '@/api'
+import { api, getRole } from '@/api'
+import { consoleBaseFromPath, isAdminRole } from '@/lib/auth'
 import { isListNode, isNumberNode, optionsSummary } from '@/lib/webappNodes'
 
 const router = useRouter()
+const route = useRoute()
+const isAdmin = computed(() => isAdminRole(getRole()) || consoleBaseFromPath(route.path) === '/admin')
+
 
 const webappId = ref('')
 const accessPassword = ref('')
@@ -154,7 +158,8 @@ async function removeSaved(id) {
 }
 
 function openInStudio(id) {
-  router.push({ path: '/studio', query: { template: id } })
+  const base = isAdmin.value ? '/admin' : '/app'
+  router.push({ path: `${base}/studio`, query: { template: id } })
 }
 
 async function openSavedDetail(t) {
@@ -323,7 +328,7 @@ onMounted(loadSaved)
                     查看
                   </Button>
                   <Button size="xs" variant="primary" @click="openInStudio(t.id)">试跑</Button>
-                  <Button size="xs" variant="outline" @click="removeSaved(t.id)">删除</Button>
+                  <Button v-if="isAdmin" size="xs" variant="outline" @click="removeSaved(t.id)">删除</Button>
                 </div>
               </td>
             </tr>

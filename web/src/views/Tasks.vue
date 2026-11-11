@@ -1,11 +1,17 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { Button, ModalShell } from 'nanocat-ui'
 import PagePanel from '@/components/ai/PagePanel.vue'
 import TableShell from '@/components/ai/TableShell.vue'
 import TonePill from '@/components/TonePill.vue'
-import { api } from '@/api'
+import { api, getRole } from '@/api'
+import { consoleBaseFromPath, isAdminRole } from '@/lib/auth'
 import { progressLabel, progressTone, statusLabel, statusTone } from '@/lib/taskLabels'
+
+const route = useRoute()
+const isAdmin = computed(() => isAdminRole(getRole()) || consoleBaseFromPath(route.path) === '/admin')
+const ownerFilter = ref('')
 
 const rows = ref([])
 const templates = ref([])
@@ -15,6 +21,21 @@ const detail = ref(null)
 const busyId = ref('')
 let timer
 const toolbarButtonClass = 'h-8 justify-center px-3 text-xs'
+
+const ownerOptions = computed(() => {
+  const set = new Set()
+  for (const t of rows.value || []) {
+    const name = String(t.owner || '').trim()
+    if (name) set.add(name)
+  }
+  return [...set].sort((a, b) => a.localeCompare(b, 'zh-CN'))
+})
+
+const filteredRows = computed(() => {
+  const owner = ownerFilter.value.trim().toLowerCase()
+  if (!owner) return rows.value
+  return (rows.value || []).filter((t) => String(t.owner || '').toLowerCase() === owner)
+})
 
 const templateById = computed(() => {
   const map = {}
@@ -56,6 +77,7 @@ const detailFields = computed(() => {
   if (!t) return []
   return [
     { label: '本地 ID', value: t.id, mono: true, copy: true },
+    { label: '调用用户', value: t.owner || (t.user_id ? `#${t.user_id}` : '—') },
     { label: '状态', value: statusLabel(t.status) },
     { label: '账号', value: t.account_email || '—' },
     { label: '账号 ID', value: t.account_id || '—' },
@@ -176,7 +198,17 @@ onUnmounted(() => clearInterval(timer))
             若中途重启导致一直「运行中」，点「查询状态」向 RH 拉一次结果；启动时也会自动恢复轮询。
           </p>
         </div>
-        <Button size="sm" variant="outline" :root-class="toolbarButtonClass" @click="refresh">刷新列表</Button>
+        <div class="flex flex-wrap items-center gap-2">
+          <select
+            v-if="isAdmin"
+            v-model="ownerFilter"
+            class="h-8 rounded-xl border border-border bg-background px-3 text-xs text-foreground"
+          >
+            <option value="">全部用户</option>
+            <option v-for="name in ownerOptions" :key="name" :value="name">{{ name }}</option>
+          </select>
+          <Button size="sm" variant="outline" :root-class="toolbarButtonClass" @click="refresh">刷新列表</Button>
+        </div>
       </div>
 
       <p v-if="okmsg" class="text-sm text-[hsl(var(--tone-success-strong))]">{{ okmsg }}</p>
@@ -187,6 +219,7 @@ onUnmounted(() => clearInterval(timer))
           <thead class="text-xs uppercase tracking-[0.16em] text-muted-foreground">
             <tr>
               <th class="py-3 pr-5">本地 ID</th>
+              <th v-if="isAdmin" class="py-3 pr-5">用户</th>
               <th class="py-3 pr-5">账号</th>
               <th class="py-3 pr-5">模板/应用</th>
               <th class="py-3 pr-5">RH Task</th>
@@ -198,9 +231,13 @@ onUnmounted(() => clearInterval(timer))
             </tr>
           </thead>
           <tbody class="text-sm text-foreground">
-            <tr v-for="t in rows" :key="t.id" class="border-t border-border/70">
+            <tr v-for="t in filteredRows" :key="t.id" class="border-t border-border/70">
               <td class="py-3 pr-5">
                 <button type="button" class="font-mono text-xs hover:underline" @click="copy(t.id)">{{ t.id }}</button>
+              </td>
+              <td v-if="isAdmin" class="py-3 pr-5">
+                <span v-if="t.owner">{{ t.owner }}</span>
+                <span v-else class="text-muted-foreground">—</span>
               </td>
               <td class="py-3 pr-5">{{ t.account_email || '—' }}</td>
               <td class="py-3 pr-5">

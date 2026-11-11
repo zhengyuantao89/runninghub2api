@@ -73,6 +73,11 @@ func (s *Server) handleAdminTemplateByID(w http.ResponseWriter, r *http.Request)
 		}
 		writeJSON(w, http.StatusOK, t)
 	case http.MethodDelete:
+		actor, _ := actorFromRequest(r)
+		if !actor.IsAdmin() {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "仅管理员可下架/删除市场模板"})
+			return
+		}
 		if err := s.store.DeleteWebappTemplate(id); errors.Is(err, store.ErrNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
 			return

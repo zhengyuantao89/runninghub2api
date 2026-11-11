@@ -85,6 +85,10 @@ func (w *Worker) SyncAndMaybePoll(taskID string, continuePoll bool) error {
 		return fmt.Errorf("account missing credentials for task (id=%d)", task.AccountID)
 	}
 
+	// QC free tasks only have batchStatus under AT; skip openapi apikey path.
+	if isQCTask(task) {
+		return w.syncAndMaybePollQC(task, acc, continuePoll)
+	}
 	mode := w.ResolvePollAuth()
 	if mode == "apikey" {
 		if err := w.syncAndMaybePollAPIKey(task, acc, continuePoll); err != nil {
@@ -97,6 +101,84 @@ func (w *Worker) SyncAndMaybePoll(taskID string, continuePoll bool) error {
 		return nil
 	}
 	return w.syncAndMaybePollAT(task, acc, continuePoll)
+}
+
+func isQCTask(task store.VideoTask) bool {
+	return runninghub.IsQCWebappID(task.WebappID)
+}
+
+func (w *Worker) syncAndMaybePollQC(task store.VideoTask, acc store.Account, continuePoll bool) error {
+	client, err := w.loginForTask(acc)
+	if err != nil {
+		return err
+	}
+	if client.AccessToken != "" && client.AccessToken != acc.AccessToken {
+		_ = w.store.UpdateAccountToken(acc.ID, client.AccessToken)
+	}
+	snap, err := runninghub.LookupQCSnapshot(client, task.RHTaskID)
+	if err != nil && egress.IsConnectivityError(err) && acc.EgressID > 0 {
+		if n, e := w.store.GetEgress(acc.EgressID); e == nil {
+			_, _ = w.egress.Rebind(acc, w.cfg.BaseURL, &n, err.Error())
+			acc.EgressID = 0
+		}
+		client, err = w.loginForTask(acc)
+		if err != nil {
+			return err
+		}
+		snap, err = runninghub.LookupQCSnapshot(client, task.RHTaskID)
+	}
+	if err != nil {
+		return err
+	}
+	if snap.RHStatus != "" || snap.ProgressText != "" {
+		_ = w.store.UpdateTaskProgress(task.ID, snap.RHStatus, snap.ProgressText, snap.QueueIndex, snap.QueueCount)
+	}
+	if snap.Done {
+		_ = w.pool.ReleaseOK(acc.ID)
+		w.refreshAccountBalance(acc.ID)
+		return w.store.FinishTaskOK(task.ID, snap.FileURL, snap.PreviewURL)
+	}
+	if snap.Failed {
+		_ = w.pool.ReleaseFail(acc.ID, "RH", snap.FailMsg)
+		w.refreshAccountBalance(acc.ID)
+		return w.store.FinishTaskFail(task.ID, "RH", snap.FailMsg)
+	}
+	if !continuePoll {
+		return nil
+	}
+	in := runninghub.RunInput{
+		AccessToken:     client.AccessToken,
+		AnonymousID:     acc.AnonymousID,
+		FingerprintJSON: acc.FingerprintJSON,
+		WebappID:        first(task.WebappID, "qc:"+runninghub.DefaultQCFreeSkuID),
+		BaseURL:         w.cfg.BaseURL,
+		OnProgress: func(p runninghub.Progress) {
+			_ = w.store.UpdateTaskProgress(task.ID, p.RHStatus, p.ProgressText, p.QueueIndex, p.QueueCount)
+			if p.AccessToken != "" || p.RefreshToken != "" {
+				_ = w.store.UpdateAccountAuthTokens(acc.ID, p.AccessToken, p.RefreshToken)
+			}
+		},
+	}
+	result, runErr := runninghub.PollQC(client, task.RHTaskID, in)
+	if runErr != nil {
+		low := strings.ToLower(runErr.Error())
+		if strings.Contains(low, "timeout") {
+			_ = w.store.UpdateTaskProgress(task.ID, first(snap.RHStatus, "RUNNING"), "轮询超时，可点「查询状态」", snap.QueueIndex, snap.QueueCount)
+			return runErr
+		}
+		if strings.Contains(low, "fail") || strings.Contains(low, "error") || strings.Contains(low, "cancel") {
+			_ = w.pool.ReleaseFail(acc.ID, "RH", runErr.Error())
+			w.refreshAccountBalance(acc.ID)
+			return w.store.FinishTaskFail(task.ID, "RH", runErr.Error())
+		}
+		return runErr
+	}
+	if result.AccessToken != "" {
+		_ = w.store.UpdateAccountToken(acc.ID, result.AccessToken)
+	}
+	_ = w.pool.ReleaseOK(acc.ID)
+	w.refreshAccountBalance(acc.ID)
+	return w.store.FinishTaskOK(task.ID, result.FileURL, result.PreviewURL)
 }
 
 func (w *Worker) ensureAccountAPIKey(acc store.Account) (string, store.Account, error) {
@@ -253,8 +335,8 @@ func (w *Worker) syncAndMaybePollAT(task store.VideoTask, acc store.Account, con
 		BaseURL:         w.cfg.BaseURL,
 		OnProgress: func(p runninghub.Progress) {
 			_ = w.store.UpdateTaskProgress(task.ID, p.RHStatus, p.ProgressText, p.QueueIndex, p.QueueCount)
-			if p.AccessToken != "" {
-				_ = w.store.UpdateAccountToken(acc.ID, p.AccessToken)
+			if p.AccessToken != "" || p.RefreshToken != "" {
+				_ = w.store.UpdateAccountAuthTokens(acc.ID, p.AccessToken, p.RefreshToken)
 			}
 		},
 	}
@@ -287,21 +369,34 @@ func (w *Worker) loginForTask(acc store.Account) (*runninghub.Client, error) {
 		baseURL = "https://www.runninghub.ai"
 	}
 	var out *runninghub.Client
+	var newAT, newRT string
 	err := w.egress.Do(acc, baseURL, func(client *runninghub.Client) error {
-		if strings.TrimSpace(acc.AccessToken) != "" {
-			client.SetAccessToken(acc.AccessToken)
+		at := strings.TrimSpace(acc.AccessToken)
+		if runninghub.AccessTokenFresh(at, 24*time.Hour) {
+			client.SetAccessToken(at)
 			out = client
 			return nil
 		}
 		if strings.TrimSpace(acc.Email) == "" || strings.TrimSpace(acc.Password) == "" {
+			if at != "" {
+				client.SetAccessToken(at)
+				out = client
+				return nil
+			}
 			return fmt.Errorf("email+password or access_token required")
 		}
 		login, err := client.PwdLogin(acc.Email, acc.Password)
 		if err != nil {
+			if at != "" {
+				client.SetAccessToken(at)
+				out = client
+				return nil
+			}
 			return err
 		}
 		data, _ := login["data"].(map[string]any)
 		token := ""
+		rt := ""
 		if data != nil {
 			if v, ok := data["access_token"].(string); ok {
 				token = strings.TrimSpace(v)
@@ -311,16 +406,33 @@ func (w *Worker) loginForTask(acc store.Account) (*runninghub.Client, error) {
 					token = strings.TrimSpace(v)
 				}
 			}
+			if v, ok := data["refresh_token"].(string); ok {
+				rt = strings.TrimSpace(v)
+			}
+			if rt == "" {
+				if v, ok := data["refreshToken"].(string); ok {
+					rt = strings.TrimSpace(v)
+				}
+			}
 		}
 		if token == "" {
+			if at != "" {
+				client.SetAccessToken(at)
+				out = client
+				return nil
+			}
 			return fmt.Errorf("login missing access_token")
 		}
 		client.SetAccessToken(token)
+		newAT, newRT = token, rt
 		out = client
 		return nil
 	})
 	if err != nil {
 		return nil, err
+	}
+	if newAT != "" {
+		_ = w.store.UpdateAccountAuthTokens(acc.ID, newAT, newRT)
 	}
 	return out, nil
 }
@@ -356,9 +468,20 @@ func (w *Worker) tick() {
 	}
 }
 
+func (w *Worker) acquireScope(taskUserID int64) int64 {
+	if taskUserID <= 0 {
+		return 0
+	}
+	u, err := w.store.GetUser(taskUserID)
+	if err == nil && u.Role == store.RoleAdmin {
+		return 0 // admin tasks may use the global account pool
+	}
+	return taskUserID
+}
+
 func (w *Worker) runOne(task store.VideoTask) error {
 	const maxAttempts = 3
-	acc, err := w.pool.Acquire(task.ID)
+	acc, err := w.pool.Acquire(w.acquireScope(task.UserID), task.ID)
 	if err != nil {
 		if errors.Is(err, accounts.ErrUnavailable) {
 			_ = w.store.RequeueTask(task.ID, "NO_ACCOUNT", "no available accounts")
@@ -372,6 +495,19 @@ func (w *Worker) runOne(task store.VideoTask) error {
 	_ = w.store.UpdateTaskRunning(task.ID, acc.ID, acc.Email, "")
 
 	webappID := first(task.WebappID, w.cfg.WebappID)
+	qcMeta, hasQCMeta := runninghub.ParseQCTaskMetaJSON(task.NodeInfoJSON)
+	nodes := parseNodeInfoList(task.NodeInfoJSON)
+	if hasQCMeta {
+		// Drop meta-only node; image path carriers (if any) remain for free-image path.
+		filtered := make([]runninghub.NodeInput, 0, len(nodes))
+		for _, n := range nodes {
+			if n.NodeID == "__qc_meta" {
+				continue
+			}
+			filtered = append(filtered, n)
+		}
+		nodes = filtered
+	}
 	in := runninghub.RunInput{
 		Email:           acc.Email,
 		Password:        acc.Password,
@@ -383,18 +519,27 @@ func (w *Worker) runOne(task store.VideoTask) error {
 		WebappID:        webappID,
 		Duration:        task.Duration,
 		AspectRatio:     task.AspectRatio,
+		Resolution:      task.Resolution,
 		AccessPassword:  w.store.GetWebappAccessPassword(webappID),
-		NodeInfoList:    parseNodeInfoList(task.NodeInfoJSON),
+		NodeInfoList:    nodes,
 		BaseURL:         w.cfg.BaseURL,
 		OnProgress: func(p runninghub.Progress) {
 			if p.TaskID != "" {
 				_ = w.store.UpdateTaskRunning(task.ID, acc.ID, acc.Email, p.TaskID)
 			}
 			_ = w.store.UpdateTaskProgress(task.ID, p.RHStatus, p.ProgressText, p.QueueIndex, p.QueueCount)
-			if p.AccessToken != "" {
-				_ = w.store.UpdateAccountToken(acc.ID, p.AccessToken)
+			if p.AccessToken != "" || p.RefreshToken != "" {
+				_ = w.store.UpdateAccountAuthTokens(acc.ID, p.AccessToken, p.RefreshToken)
 			}
 		},
+	}
+	if hasQCMeta {
+		in.BindingID = qcMeta.BindingID
+		in.SkuID = qcMeta.SkuID
+		in.CategoryID = qcMeta.CategoryID
+		in.CreationMode = qcMeta.CreationMode
+		in.QCParams = qcMeta.Params
+		in.AllowPaid = qcMeta.AllowPaid
 	}
 
 	egSess, egErr := w.egress.NewClientForAccount(acc, w.cfg.BaseURL)
@@ -403,12 +548,22 @@ func (w *Worker) runOne(task store.VideoTask) error {
 	}
 	egress.AttachHTTP(&in, egSess)
 
-	sess, runErr := runninghub.SubmitWebappVideo(in)
+	submit := runninghub.SubmitWebappVideo
+	mode := config.NormalizeSubmitMode(w.cfg.SubmitMode)
+	switch {
+	case hasQCMeta || mode == runninghub.SubmitModeQC:
+		submit = runninghub.SubmitQCGeneric
+	case runninghub.IsQCImageWebappID(task.WebappID) || mode == runninghub.SubmitModeQCFreeImage:
+		submit = runninghub.SubmitQCFreeImage
+	case strings.HasPrefix(strings.TrimSpace(task.WebappID), "qc:") || mode == runninghub.SubmitModeQCFree:
+		submit = runninghub.SubmitQCFreeVideo
+	}
+	sess, runErr := submit(in)
 	if runErr != nil && egress.IsConnectivityError(runErr) && egSess.Node != nil {
 		egSess2, reErr := w.egress.Rebind(acc, w.cfg.BaseURL, egSess.Node, runErr.Error())
 		if reErr == nil {
 			egress.AttachHTTP(&in, egSess2)
-			sess, runErr = runninghub.SubmitWebappVideo(in)
+			sess, runErr = submit(in)
 			if runErr == nil {
 				w.egress.MarkOK(egSess2)
 			}
@@ -418,6 +573,13 @@ func (w *Worker) runOne(task store.VideoTask) error {
 	}
 	if runErr != nil {
 		return w.failOrRequeue(task, acc.ID, runErr, maxAttempts)
+	}
+	if sess != nil && sess.WebappID != "" {
+		task.WebappID = sess.WebappID
+		_ = w.store.UpdateTaskWebappID(task.ID, sess.WebappID)
+	}
+	if sess != nil && (sess.Kind == runninghub.SessionKindQC || runninghub.IsQCWebappID(sess.WebappID)) {
+		accounts.RefreshFreeQuota(w.store, sess.Client, acc.ID)
 	}
 	_ = w.store.UpdateTaskRunning(task.ID, acc.ID, acc.Email, sess.TaskID)
 	return w.finishPoll(task, acc, sess, in, maxAttempts)
@@ -457,28 +619,37 @@ func (w *Worker) failOrRequeue(task store.VideoTask, accountID int64, runErr err
 	return runErr
 }
 
-// refreshAccountBalance pulls remainCoins / currentTaskCounts via consumer apiKey after a task ends.
+// refreshAccountBalance pulls wallet via NEW point/summary or OLD apiKey accountStatus.
 func (w *Worker) refreshAccountBalance(accountID int64) {
 	acc, err := w.store.GetAccount(accountID)
 	if err != nil {
 		return
 	}
-	var st map[string]any
+	var wallet runninghub.Wallet
 	err = w.egress.Do(acc, w.cfg.BaseURL, func(client *runninghub.Client) error {
+		at := strings.TrimSpace(acc.AccessToken)
+		if at != "" {
+			client.SetAccessToken(at)
+		}
 		apiKey := strings.TrimSpace(acc.APIKey)
-		if apiKey == "" {
-			got, e := client.EnsureConsumerApiKey(acc.Email, acc.Password, acc.AccessToken)
-			if e != nil {
+		// NEW path only needs AT; OLD still needs consumer apiKey.
+		if apiKey == "" && (at == "" || strings.EqualFold(acc.BillingVersion, runninghub.BillingOld) || acc.BillingVersion == "") {
+			got, e := client.EnsureConsumerApiKey(acc.Email, acc.Password, at)
+			if e == nil {
+				apiKey = got.APIKey
+				_ = w.store.UpdateAccountAPIKey(accountID, apiKey)
+				_ = w.store.UpdateAccountAuthTokens(accountID, got.AccessToken, got.RefreshToken)
+				acc.APIKey = apiKey
+				if got.AccessToken != "" {
+					client.SetAccessToken(got.AccessToken)
+				}
+			} else if at == "" {
 				return e
 			}
-			apiKey = got.APIKey
-			_ = w.store.UpdateAccountAPIKey(accountID, apiKey)
-			_ = w.store.UpdateAccountAuthTokens(accountID, got.AccessToken, got.RefreshToken)
-			acc.APIKey = apiKey
 		}
 		var e error
-		st, e = client.AccountStatus(apiKey)
-		if e != nil {
+		wallet, e = client.FetchWallet(apiKey)
+		if e != nil && apiKey != "" {
 			got, e2 := client.EnsureConsumerApiKey(acc.Email, acc.Password, "")
 			if e2 != nil {
 				return e
@@ -486,39 +657,33 @@ func (w *Worker) refreshAccountBalance(accountID int64) {
 			apiKey = got.APIKey
 			_ = w.store.UpdateAccountAPIKey(accountID, apiKey)
 			_ = w.store.UpdateAccountAuthTokens(accountID, got.AccessToken, got.RefreshToken)
-			acc.APIKey = apiKey
-			st, e = client.AccountStatus(apiKey)
-			return e
+			if got.AccessToken != "" {
+				client.SetAccessToken(got.AccessToken)
+			}
+			wallet, e = client.FetchWallet(apiKey)
 		}
-		return nil
+		if e == nil {
+			accounts.RefreshFreeQuota(w.store, client, accountID)
+		}
+		return e
 	})
 	if err != nil {
 		log.Printf("[account %d] refresh balance failed: %v", accountID, err)
 		return
 	}
-	data, _ := st["data"].(map[string]any)
-	remain, counts, apiType := "", "", ""
-	if data != nil {
-		if v, ok := data["remainCoins"]; ok {
-			remain = fmt.Sprint(v)
-		}
-		if v, ok := data["currentTaskCounts"]; ok {
-			counts = fmt.Sprint(v)
-		}
-		if v, ok := data["apiType"]; ok {
-			apiType = fmt.Sprint(v)
-		}
-	}
-	if err := w.store.UpdateAccountBalance(accountID, remain, counts, apiType); err != nil {
+	if err := w.store.UpdateAccountWallet(accountID, wallet.RemainCoins, wallet.RemainPoints, wallet.CurrentTaskCounts, wallet.APIType, wallet.BillingVersion); err != nil {
 		log.Printf("[account %d] save balance failed: %v", accountID, err)
 		return
 	}
-	log.Printf("[account %d] balance refreshed remain=%s counts=%s type=%s", accountID, remain, counts, apiType)
+	log.Printf("[account %d] balance refreshed coins=%s points=%s spendable=%s counts=%s type=%s billing=%s",
+		accountID, wallet.RemainCoins, wallet.RemainPoints, wallet.Spendable(), wallet.CurrentTaskCounts, wallet.APIType, wallet.BillingVersion)
 }
 
 func classifyErr(err error) string {
 	msg := strings.ToLower(err.Error())
 	switch {
+	case strings.Contains(msg, "qc not free"), strings.Contains(msg, "prepare not free"):
+		return "NO_COINS"
 	case strings.Contains(msg, "login"), strings.Contains(msg, "pwdlogin"), strings.Contains(msg, "401"),
 		strings.Contains(msg, "token_invalid"), strings.Contains(msg, "412"),
 		strings.Contains(msg, "user_not_found"):

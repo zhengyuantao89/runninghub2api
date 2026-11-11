@@ -1,10 +1,16 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { RouterLink } from 'vue-router'
+import { RouterLink, useRoute } from 'vue-router'
 import { Button, StatusPill } from 'nanocat-ui'
 import MetricStrip from '@/components/ai/MetricStrip.vue'
 import PagePanel from '@/components/ai/PagePanel.vue'
 import { api } from '@/api'
+import { consoleBaseFromPath } from '@/lib/auth'
+
+const route = useRoute()
+const base = computed(() => consoleBaseFromPath(route.path))
+const tasksPath = computed(() => `${base.value}/tasks`)
+const accountsPath = computed(() => `${base.value}/accounts`)
 
 const accounts = ref([])
 const tasks = ref([])
@@ -25,9 +31,14 @@ const pool = computed(() => {
   const busy = list.filter((x) => x.busy)
   const disabled = list.filter((x) => x.status !== 'active')
   const cooling = list.filter((x) => x.cooldown_until)
-  const noCoins = list.filter((x) => x.last_balance_at && parseCoins(x.remain_coins) <= 0)
+  const spendable = (x) =>
+    String(x.billing_version || '').toUpperCase() === 'NEW'
+      ? parseCoins(x.remain_points)
+      : parseCoins(x.remain_coins)
+  const noCoins = list.filter((x) => x.last_balance_at && spendable(x) <= 0)
   const withKey = list.filter((x) => x.has_api_key)
   const totalCoins = list.reduce((sum, x) => sum + parseCoins(x.remain_coins), 0)
+  const totalPoints = list.reduce((sum, x) => sum + parseCoins(x.remain_points), 0)
   return {
     total: list.length,
     active: active.length,
@@ -38,6 +49,7 @@ const pool = computed(() => {
     noCoins: noCoins.length,
     withKey: withKey.length,
     totalCoins,
+    totalPoints,
   }
 })
 
@@ -77,7 +89,7 @@ const job = computed(() => {
 
 const metricItems = computed(() => [
   { key: 'pool', label: '号池总数', value: pool.value.total, meta: `可调度 ${pool.value.dispatchable}` },
-  { key: 'coins', label: 'RH 币合计', value: pool.value.totalCoins, meta: `有 Key ${pool.value.withKey}` },
+  { key: 'coins', label: 'RH 币合计', value: pool.value.totalCoins, meta: `积分 ${pool.value.totalPoints}` },
   { key: 'inflight', label: '在途任务', value: job.value.inFlight, meta: `排队 ${job.value.queued} · 运行 ${job.value.running}` },
   { key: 'rate', label: '成功率', value: `${job.value.rate}%`, meta: `成功 ${job.value.succeeded} / 完结 ${job.value.done}` },
 ])
@@ -89,7 +101,7 @@ const poolBars = computed(() => {
     { key: 'dispatchable', label: '可调度', value: p.dispatchable, tone: 'ok' },
     { key: 'busy', label: '占用中', value: p.busy, tone: 'info' },
     { key: 'cooling', label: '冷却中', value: p.cooling, tone: 'warn' },
-    { key: 'noCoins', label: '无积分', value: p.noCoins, tone: 'err' },
+    { key: 'noCoins', label: '无余额', value: p.noCoins, tone: 'err' },
     { key: 'disabled', label: '已禁用', value: p.disabled, tone: 'mute' },
   ].map((x) => ({ ...x, pct: Math.round((x.value / max) * 100) }))
 })
@@ -106,11 +118,23 @@ const jobBars = computed(() => {
   ].map((x) => ({ ...x, pct: Math.round((x.value / max) * 100) }))
 })
 
+function accountSpendable(x) {
+  return String(x.billing_version || '').toUpperCase() === 'NEW'
+    ? parseCoins(x.remain_points)
+    : parseCoins(x.remain_coins)
+}
+
+function freeQuotaLabel(remaining, total) {
+  const t = Number(total || 0)
+  if (!t) return '—'
+  return `${Number(remaining || 0)}/${t}`
+}
+
 const accountRows = computed(() => {
   return [...(accounts.value || [])]
     .sort((a, b) => {
       if (!!b.dispatchable !== !!a.dispatchable) return b.dispatchable ? 1 : -1
-      return parseCoins(b.remain_coins) - parseCoins(a.remain_coins)
+      return accountSpendable(b) - accountSpendable(a)
     })
     .slice(0, 12)
 })
@@ -126,7 +150,7 @@ function poolLabel(row) {
   if (row.dispatchable) return '可调度'
   if (row.busy) return '占用中'
   if (row.status !== 'active') return '已禁用'
-  if (row.last_balance_at && parseCoins(row.remain_coins) <= 0) return '无积分'
+  if (row.last_balance_at && accountSpendable(row) <= 0) return '无余额'
   if (row.cooldown_until) return '冷却中'
   return '不可用'
 }
@@ -161,7 +185,7 @@ onUnmounted(() => clearInterval(timer))
         </p>
         <div class="flex flex-wrap gap-2">
           <RouterLink
-            to="/tasks"
+            :to="tasksPath"
             class="inline-flex h-8 items-center justify-center rounded-md border border-border px-3 text-xs text-foreground hover:bg-muted/50"
           >
             查看任务队列
@@ -183,7 +207,7 @@ onUnmounted(() => clearInterval(timer))
               <h2 class="text-sm font-semibold text-foreground">号池结构</h2>
               <p class="mt-1 text-xs text-muted-foreground">按可调度 / 占用 / 冷却 / 积分拆分</p>
             </div>
-            <RouterLink class="text-xs text-muted-foreground underline-offset-2 hover:underline" to="/accounts">
+            <RouterLink class="text-xs text-muted-foreground underline-offset-2 hover:underline" :to="accountsPath">
               号池管理
             </RouterLink>
           </div>
@@ -216,7 +240,7 @@ onUnmounted(() => clearInterval(timer))
               <h2 class="text-sm font-semibold text-foreground">任务结构</h2>
               <p class="mt-1 text-xs text-muted-foreground">全量任务状态分布 · 成功率 {{ job.rate }}%</p>
             </div>
-            <RouterLink class="text-xs text-muted-foreground underline-offset-2 hover:underline" to="/tasks">
+            <RouterLink class="text-xs text-muted-foreground underline-offset-2 hover:underline" :to="tasksPath">
               任务队列
             </RouterLink>
           </div>
@@ -247,16 +271,20 @@ onUnmounted(() => clearInterval(timer))
       <div class="grid gap-4 lg:grid-cols-2">
         <section class="rounded-2xl border border-border/80 bg-card p-4">
           <div class="mb-3">
-            <h2 class="text-sm font-semibold text-foreground">账号积分快照</h2>
-            <p class="mt-1 text-xs text-muted-foreground">按可调度优先，展示剩余 RH 币</p>
+            <h2 class="text-sm font-semibold text-foreground">账号余额快照</h2>
+            <p class="mt-1 text-xs text-muted-foreground">RH 币与新积分分列；调度按体系取可消费余额</p>
           </div>
           <div class="overflow-x-auto">
-            <table class="w-full min-w-[420px] text-left text-sm">
+            <table class="w-full min-w-[480px] text-left text-sm">
               <thead class="text-xs uppercase tracking-[0.14em] text-muted-foreground">
                 <tr>
                   <th class="py-2 pr-3">账号</th>
                   <th class="py-2 pr-3">状态</th>
+                  <th class="py-2 pr-3">体系</th>
                   <th class="py-2 pr-3">RH币</th>
+                  <th class="py-2 pr-3">积分</th>
+                  <th class="py-2 pr-3">图片</th>
+                  <th class="py-2 pr-3">视频</th>
                   <th class="py-2">并发</th>
                 </tr>
               </thead>
@@ -266,13 +294,17 @@ onUnmounted(() => clearInterval(timer))
                   <td class="py-2.5 pr-3">
                     <StatusPill :tone="poolTone(a)" :label="poolLabel(a)" />
                   </td>
+                  <td class="py-2.5 pr-3 font-mono text-xs">{{ a.billing_version || 'OLD' }}</td>
                   <td class="py-2.5 pr-3 font-medium">{{ a.remain_coins || '—' }}</td>
+                  <td class="py-2.5 pr-3 font-medium">{{ a.remain_points || '—' }}</td>
+                  <td class="py-2.5 pr-3 font-mono text-xs">{{ freeQuotaLabel(a.free_image_remaining, a.free_image_total) }}</td>
+                  <td class="py-2.5 pr-3 font-mono text-xs">{{ freeQuotaLabel(a.free_video_remaining, a.free_video_total) }}</td>
                   <td class="py-2.5 font-mono text-xs text-muted-foreground">
                     {{ a.inflight || 0 }}/{{ a.max_concurrency || 1 }}
                   </td>
                 </tr>
                 <tr v-if="!accountRows.length">
-                  <td colspan="4" class="py-8 text-center text-sm text-muted-foreground">暂无账号统计</td>
+                  <td colspan="8" class="py-8 text-center text-sm text-muted-foreground">暂无账号统计</td>
                 </tr>
               </tbody>
             </table>

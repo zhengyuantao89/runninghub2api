@@ -2,16 +2,21 @@
 .env
 .env.local
 .env.*.local
+docker-compose.override.yml
 *.pem
 *.key
 .auth_key.txt
 **/服务器.txt
 服务器.txt
+服务器*.txt
+*服务器*copy*.txt
 
 # runtime / local data
 data/
 deploy_stage/
+docker_ctx/
 bin/
+Dockerfile.local
 *.exe
 *.exe~
 *.db

@@ -14,6 +14,7 @@ import (
 	"github.com/trae/runninghub2api/internal/httpapi"
 	"github.com/trae/runninghub2api/internal/store"
 	"github.com/trae/runninghub2api/internal/tasks"
+	"github.com/trae/runninghub2api/internal/uploads"
 )
 
 func main() {
@@ -24,6 +25,15 @@ func main() {
 		log.Fatalf("open store: %v", err)
 	}
 	defer st.Close()
+
+	admin, err := st.EnsureAdminUser(cfg.AdminUser, cfg.AdminPassword)
+	if err != nil {
+		log.Fatalf("ensure admin user: %v", err)
+	}
+	if err := st.AssignOrphanRowsToUser(admin.ID); err != nil {
+		log.Printf("assign orphan rows: %v", err)
+	}
+	_ = st.SetRegistrationEnabled(st.RegistrationEnabled())
 
 	pool := accounts.New(st, time.Duration(cfg.SubmitGapSec)*time.Second)
 	worker := tasks.NewWorker(st, pool, cfg)
@@ -38,6 +48,10 @@ func main() {
 	subPoller := egress.NewSubscriptionPoller(st, time.Minute)
 	subPoller.Start()
 	defer subPoller.Stop()
+
+	uploadCleaner := uploads.NewCleaner(st, cfg.DataDir, cfg.UploadKeepHours, 30*time.Minute)
+	uploadCleaner.Start()
+	defer uploadCleaner.Stop()
 
 	srv := httpapi.New(cfg, st, pool, worker, dailyClaimer)
 	httpServer := &http.Server{Addr: cfg.Addr, Handler: srv.Handler()}

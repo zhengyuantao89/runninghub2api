@@ -61,16 +61,20 @@
   }
 }
 
-.logo-mark .logo-cat-wrapper {
+.logo-mark,
+.brand-mark {
+  transform: translateY(2px);
+}
+
+.logo-mark .logo-cat-wrapper,
+.logo-mark .logo-dog-wrapper,
+.brand-mark .logo-dog-wrapper {
   animation: logo-float 4s ease-in-out infinite;
   transform-origin: center;
 }
 
-.logo-mark {
-  transform: translateY(2px);
-}
-
-.logo-mark .logo-eye {
+.logo-mark .logo-eye,
+.brand-mark .logo-eye {
   fill: #00bcd4;
   filter: drop-shadow(0 0 2px #00bcd4);
   animation: logo-blink 5s infinite;

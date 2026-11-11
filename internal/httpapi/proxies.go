@@ -12,11 +12,49 @@ import (
 	"github.com/trae/runninghub2api/internal/store"
 )
 
+func queryIntDefault(r *http.Request, key string, fallback int) int {
+	raw := strings.TrimSpace(r.URL.Query().Get(key))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
 func (s *Server) handleAdminProxies(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		group := strings.TrimSpace(r.URL.Query().Get("group"))
-		list, err := s.store.ListEgress(group)
+		page := queryIntDefault(r, "page", 1)
+		pageSize := queryIntDefault(r, "page_size", 50)
+		if page < 1 {
+			page = 1
+		}
+		if pageSize < 1 {
+			pageSize = 50
+		}
+		if pageSize > 200 {
+			pageSize = 200
+		}
+		total, err := s.store.CountEgress(group)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		pages := 0
+		if total > 0 {
+			pages = (total + pageSize - 1) / pageSize
+		}
+		if pages == 0 {
+			page = 1
+		} else if page > pages {
+			page = pages
+		}
+		offset := (page - 1) * pageSize
+		list, err := s.store.ListEgressPage(group, pageSize, offset)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
@@ -25,7 +63,13 @@ func (s *Server) handleAdminProxies(w http.ResponseWriter, r *http.Request) {
 		for i := range list {
 			list[i].Password = ""
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": list, "total": len(list)})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items":     list,
+			"total":     total,
+			"page":      page,
+			"page_size": pageSize,
+			"pages":     pages,
+		})
 	case http.MethodPost:
 		s.importProxiesFromBody(w, r, "manual")
 	default:
@@ -135,7 +179,7 @@ func (s *Server) importProxiesFromBody(w http.ResponseWriter, r *http.Request, d
 
 // parseProxyPushBody accepts:
 //   - JSON array / {items|proxies}
-//   - { text, group_name?, exact_sync? } plain-text lines (gpt-plus batch-import)
+//   - { text, group_name?, exact_sync? } plain-text lines (batch import)
 // Returns exactGroup non-empty when caller should ExactSync.
 func parseProxyPushBody(raw []byte) ([]store.EgressNode, string, string, error) {
 	trim := strings.TrimSpace(string(raw))

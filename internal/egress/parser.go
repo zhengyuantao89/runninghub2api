@@ -9,7 +9,7 @@ import (
 	"github.com/trae/runninghub2api/internal/store"
 )
 
-// ParseProxies parses gpt-plus style plain-text lines into egress nodes.
+// ParseProxies parses plain-text proxy lines into egress nodes.
 // Supported:
 //
 //	type://user:pass@host:port
@@ -143,7 +143,7 @@ func normalizeProxyType(t string) string {
 	}
 }
 
-// Fingerprint matches gpt-plus subscription exact-sync key.
+// Fingerprint is the exact-sync identity key for a proxy line.
 func Fingerprint(n store.EgressNode) string {
 	t := normalizeProxyType(n.ProxyType)
 	if t == "" {

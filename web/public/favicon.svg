@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Light plate so tab icon never looks dark -->
+  <rect width="64" height="64" rx="12" fill="#F7F5F1"/>
+  <g transform="translate(0,2)">
+    <!-- Floppy dog ears  wide, hanging, clearly not pointed cat ears -->
+    <path d="M10 22 C6 18 4 28 7 40 C9 48 16 50 18 42 C19 34 16 26 10 22Z" fill="#2c3e50"/>
+    <path d="M54 22 C58 18 60 28 57 40 C55 48 48 50 46 42 C45 34 48 26 54 22Z" fill="#2c3e50"/>
+    <path d="M11 28 C9 32 10 40 12 44 C14 42 15 34 13 30Z" fill="#4a657a"/>
+    <path d="M53 28 C55 32 54 40 52 44 C50 42 49 34 51 30Z" fill="#4a657a"/>
+
+    <!-- White rounded head -->
+    <path
+      d="M18 18 H46 A8 8 0 0 1 54 26 V40 A16 16 0 0 1 38 56 H26 A16 16 0 0 1 10 40 V26 A8 8 0 0 1 18 18 Z"
+      fill="#ffffff"
+      stroke="#2c3e50"
+      stroke-width="2.2"
+    />
+
+    <!-- Cyan bar eyes -->
+    <rect x="20" y="32" width="8" height="2.5" rx="1" fill="#00bcd4"/>
+    <rect x="36" y="32" width="8" height="2.5" rx="1" fill="#00bcd4"/>
+
+    <!-- Nose + smile snout -->
+    <ellipse cx="32" cy="42" rx="3.2" ry="2.4" fill="#2c3e50"/>
+    <path d="M26 45 Q32 51 38 45" fill="none" stroke="#2c3e50" stroke-width="2" stroke-linecap="round"/>
+  </g>
+</svg>
