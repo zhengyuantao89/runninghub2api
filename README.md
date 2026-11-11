@@ -102,3 +102,7 @@ docker compose up -d --build
 ```
 
 数据卷：`rh2api_data` → 容器 `/app/data`。
+
+## 致谢
+
+部分控制台交互与开源推广实践参考了 [chatgpt2api](https://github.com/yukkcat/chatgpt2api)。
