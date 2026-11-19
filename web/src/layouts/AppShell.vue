@@ -152,8 +152,6 @@ const docsPath = computed(() => `${consoleBase.value}/docs`)
 const icons = {
   dash: 'M4 4h7v7H4V4zm9 0h7v4h-7V4zm0 6h7v10h-7V10zM4 13h7v7H4v-7z',
   accounts: 'M12 12a3.5 3.5 0 1 0-3.5-3.5A3.5 3.5 0 0 0 12 12zm0 2c-4.1 0-7.5 2.2-7.5 5v1h15v-1c0-2.8-3.4-5-7.5-5z',
-  mail: 'M4 6h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1zm8 6.2L4.8 7.6 4 8.3 12 14l8-5.7-.8-.7L12 12.2z',
-  register: 'M12 2a5 5 0 0 1 5 5v1h1a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h1V7a5 5 0 0 1 5-5zm0 2a3 3 0 0 0-3 3v1h6V7a3 3 0 0 0-3-3zm-1 8v2h2v-2h2v-2h-2v-2h-2v2H9v2h2z',
   egress: 'M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm1 14.93V19h-2v-2.07A8 8 0 0 1 4.07 13H2v-2h2.07A8 8 0 0 1 11 4.07V2h2v2.07A8 8 0 0 1 19.93 11H22v2h-2.07A8 8 0 0 1 13 16.93z',
   webapps: 'M4 4h7v7H4V4zm9 0h7v7h-7V4zM4 13h7v7H4v-7zm9 0h7v7h-7v-7z',
   tasks: 'M4 6h16v2H4V6zm0 5h16v2H4v-2zm0 5h10v2H4v-2z',
@@ -170,8 +168,6 @@ const menuItems = computed(() => {
     return [
       { path: base, label: '概览中心', icon: icons.dash },
       { path: `${base}/accounts`, label: '号池管理', icon: icons.accounts },
-      { path: `${base}/mail-inboxes`, label: '邮箱池', icon: icons.mail },
-      { path: `${base}/register`, label: '账号注册', icon: icons.register },
       { path: `${base}/egress`, label: '代理与结果', icon: icons.egress },
       { path: `${base}/webapps`, label: '应用模板', icon: icons.webapps },
       { path: `${base}/tasks`, label: '任务队列', icon: icons.tasks },
@@ -185,8 +181,6 @@ const menuItems = computed(() => {
   return [
     { path: base, label: '概览中心', icon: icons.dash },
     { path: `${base}/accounts`, label: '号池管理', icon: icons.accounts },
-    { path: `${base}/mail-inboxes`, label: '邮箱池', icon: icons.mail },
-    { path: `${base}/register`, label: '账号注册', icon: icons.register },
     { path: `${base}/webapps`, label: '应用模板', icon: icons.webapps },
     { path: `${base}/tasks`, label: '任务队列', icon: icons.tasks },
     { path: `${base}/studio`, label: '试跑工作室', icon: icons.studio },

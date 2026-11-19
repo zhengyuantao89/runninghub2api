@@ -1,4 +1,4 @@
-package register
+package accounts
 
 import (
 	"encoding/json"

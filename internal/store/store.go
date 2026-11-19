@@ -397,12 +397,6 @@ CREATE INDEX IF NOT EXISTS idx_webapp_templates_updated ON webapp_templates(upda
 	}
 	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id, status)`)
 	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_video_tasks_user ON video_tasks(user_id, status, created_at)`)
-	if err := s.migrateMailInboxes(); err != nil {
-		return err
-	}
-	if err := s.migrateRegisterJobs(); err != nil {
-		return err
-	}
 	if err := s.migrateSessions(); err != nil {
 		return err
 	}

@@ -13,14 +13,10 @@ import Webapps from './views/Webapps.vue'
 import Egress from './views/Egress.vue'
 import ApiKeys from './views/ApiKeys.vue'
 import Users from './views/Users.vue'
-import MailInboxes from './views/MailInboxes.vue'
-import Register from './views/Register.vue'
 
 const userChildren = [
   { path: '', component: Dashboard, meta: { title: '概览中心' } },
   { path: 'accounts', component: Accounts, meta: { title: '号池管理' } },
-  { path: 'mail-inboxes', component: MailInboxes, meta: { title: '邮箱池' } },
-  { path: 'register', component: Register, meta: { title: '账号注册' } },
   { path: 'webapps', component: Webapps, meta: { title: '应用模板' } },
   { path: 'tasks', component: Tasks, meta: { title: '任务队列' } },
   { path: 'studio', component: Studio, meta: { title: '试跑工作室' } },
@@ -32,8 +28,6 @@ const userChildren = [
 const adminChildren = [
   { path: '', component: Dashboard, meta: { title: '概览中心' } },
   { path: 'accounts', component: Accounts, meta: { title: '号池管理' } },
-  { path: 'mail-inboxes', component: MailInboxes, meta: { title: '邮箱池' } },
-  { path: 'register', component: Register, meta: { title: '账号注册' } },
   { path: 'egress', component: Egress, meta: { title: '代理与结果' } },
   { path: 'webapps', component: Webapps, meta: { title: '应用模板' } },
   { path: 'tasks', component: Tasks, meta: { title: '任务队列' } },
@@ -47,8 +41,6 @@ const adminChildren = [
 /** Old flat console paths → suffix under /app or /admin */
 const legacyMap = {
   '/accounts': 'accounts',
-  '/mail-inboxes': 'mail-inboxes',
-  '/register': 'register',
   '/egress': 'egress',
   '/webapps': 'webapps',
   '/tasks': 'tasks',

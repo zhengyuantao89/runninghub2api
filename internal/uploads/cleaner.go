@@ -83,8 +83,8 @@ func (c *Cleaner) loop() {
 			if err != nil {
 				log.Printf("retention cleaner: %v", err)
 			} else if files > 0 || tasks > 0 || jobs > 0 {
-				log.Printf("retention cleaner: files=%d tasks=%d register_jobs=%d (keep=%dh)",
-					files, tasks, jobs, int(c.keepFor().Hours()))
+				log.Printf("retention cleaner: files=%d tasks=%d (keep=%dh)",
+					files, tasks, int(c.keepFor().Hours()))
 			}
 			timer.Reset(c.interval)
 		}
@@ -108,8 +108,8 @@ func (c *Cleaner) underUploads(path string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
 
-// RunOnce deletes expired uploads, terminal task rows, and finished register jobs.
-// Returns deleted file / task / register-job counts.
+// RunOnce deletes expired uploads and terminal task rows.
+// Returns deleted file / task counts (jobs always 0).
 func (c *Cleaner) RunOnce() (files, tasks, jobs int, err error) {
 	upDir := c.uploadsDir()
 	if err = os.MkdirAll(upDir, 0o755); err != nil {
@@ -178,7 +178,7 @@ func (c *Cleaner) RunOnce() (files, tasks, jobs int, err error) {
 		files++
 	}
 
-	// keep=0 means "clean upload files ASAP" only — never wipe task/register history.
+	// keep=0 means "clean upload files ASAP" only — never wipe task history.
 	// Record purge requires an explicit positive retention window.
 	if keep <= 0 {
 		return files, 0, 0, nil
@@ -209,9 +209,5 @@ func (c *Cleaner) RunOnce() (files, tasks, jobs int, err error) {
 		}
 	}
 
-	jobs, err = c.store.PurgeFinishedRegisterJobsBefore(cutoff, 200)
-	if err != nil {
-		return files, tasks, jobs, err
-	}
-	return files, tasks, jobs, nil
+	return files, tasks, 0, nil
 }

@@ -22,7 +22,6 @@ import (
 	"github.com/trae/runninghub2api/internal/config"
 	"github.com/trae/runninghub2api/internal/egress"
 	"github.com/trae/runninghub2api/internal/provider/runninghub"
-	"github.com/trae/runninghub2api/internal/register"
 	"github.com/trae/runninghub2api/internal/store"
 	"github.com/trae/runninghub2api/internal/tasks"
 )
@@ -34,7 +33,6 @@ type Server struct {
 	worker       *tasks.Worker
 	dailyClaimer *accounts.DailyLoginClaimer
 	egress       *egress.Manager
-	register     *register.Service
 	mux          *http.ServeMux
 	sessions     *sessionStore
 }
@@ -47,7 +45,6 @@ func New(cfg config.Config, st *store.Store, pool *accounts.Pool, worker *tasks.
 		worker:       worker,
 		dailyClaimer: dailyClaimer,
 		egress:       egress.NewManager(st),
-		register:     register.NewService(st, cfg.BaseURL),
 		mux:          http.NewServeMux(),
 		sessions:     newSessionStore(st, 7*24*time.Hour),
 	}
@@ -114,11 +111,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/proxies/subscriptions", s.withAdmin(s.handleProxySubscriptions))
 	s.mux.HandleFunc("/admin/proxies/", s.withAdmin(s.handleAdminProxyByID))
 	s.mux.HandleFunc("/admin/proxies", s.withAdmin(s.handleAdminProxies))
-	s.mux.HandleFunc("/admin/mail-inboxes/", s.withActor(s.handleMailInboxByID))
-	s.mux.HandleFunc("/admin/mail-inboxes", s.withActor(s.handleMailInboxes))
-	s.mux.HandleFunc("/admin/register-jobs/", s.withActor(s.handleRegisterJobByID))
-	s.mux.HandleFunc("/admin/register-jobs", s.withActor(s.handleRegisterJobs))
-
 	// 普通用户可用个人 API Key 推送到自己的号池；管理员可指定 user_id。
 	s.mux.HandleFunc("/admin/sync/accounts", s.withActor(s.handlePushAccounts))
 	s.mux.HandleFunc("/api/accounts/push", s.withActor(s.handlePushAccounts))
@@ -318,9 +310,6 @@ func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 			"upload_keep_hours_default": store.NormalizeUploadKeepHours(s.cfg.UploadKeepHours),
 			"role":                      a.Role,
 		}
-		for k, v := range s.captchaSettingsViewFor(a.UserID, a.IsAdmin()) {
-			out[k] = v
-		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodPut, http.MethodPost:
 		rawBody, err := io.ReadAll(r.Body)
@@ -368,34 +357,6 @@ func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			out["upload_keep_hours"] = hours
-		}
-		var rawMap map[string]json.RawMessage
-		_ = json.Unmarshal(rawBody, &rawMap)
-		if _, hasCap := rawMap["captcha"]; hasCap {
-			if err := s.applyCaptchaRegisterSettingsFor(a.UserID, rawMap, a.IsAdmin()); err != nil {
-				writeJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
-				return
-			}
-			for k, v := range s.captchaSettingsViewFor(a.UserID, a.IsAdmin()) {
-				out[k] = v
-			}
-		} else if _, hasReg := rawMap["register"]; hasReg {
-			if err := s.applyCaptchaRegisterSettingsFor(a.UserID, rawMap, a.IsAdmin()); err != nil {
-				writeJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
-				return
-			}
-			for k, v := range s.captchaSettingsViewFor(a.UserID, a.IsAdmin()) {
-				out[k] = v
-			}
-		} else if _, hasEg := rawMap["egress"]; hasEg {
-			if !a.IsAdmin() {
-				writeJSON(w, http.StatusForbidden, map[string]any{"error": "仅管理员可改出口模式"})
-				return
-			}
-			_ = s.applyCaptchaRegisterSettingsFor(a.UserID, rawMap, true)
-			for k, v := range s.captchaSettingsViewFor(a.UserID, true) {
-				out[k] = v
-			}
 		}
 		writeJSON(w, http.StatusOK, out)
 	default:
@@ -1856,7 +1817,7 @@ func (s *Server) handleEditNicknames(w http.ResponseWriter, r *http.Request) {
 			if len(body.IDs) == 1 && nick != "" {
 				// keep nick
 			} else {
-				nick = register.RandomNickName()
+				nick = accounts.RandomNickName()
 			}
 		}
 		_, result, err := s.editAccountNickName(id, nick)
@@ -1886,7 +1847,7 @@ func (s *Server) editAccountNickName(id int64, nickName string) (store.Account, 
 	}
 	nickName = strings.TrimSpace(nickName)
 	if nickName == "" {
-		nickName = register.RandomNickName()
+		nickName = accounts.RandomNickName()
 	}
 	if strings.TrimSpace(acc.Password) == "" && strings.TrimSpace(acc.AccessToken) == "" {
 		return acc, nil, fmt.Errorf("缺少密码与 Access Token，无法登录改昵称")
@@ -2031,15 +1992,15 @@ func (s *Server) handleBackfillFingerprints(w http.ResponseWriter, r *http.Reque
 		}
 		anon := strings.TrimSpace(acc.AnonymousID)
 		if anon == "" {
-			anon = register.RandomAnonymousID()
+			anon = accounts.RandomAnonymousID()
 		}
 		device := strings.TrimSpace(acc.DeviceID)
 		if device == "" {
-			device = register.RandomDeviceID()
+			device = accounts.RandomDeviceID()
 		}
 		fp := strings.TrimSpace(acc.FingerprintJSON)
 		if fp == "" {
-			fp = register.DefaultFingerprintJSON()
+			fp = accounts.DefaultFingerprintJSON()
 		}
 		filled, err := s.store.FillAccountIdentityEmpty(id, anon, device, fp)
 		if err != nil {

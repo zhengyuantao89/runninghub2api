@@ -11,8 +11,6 @@ const router = useRouter()
 const loading = ref(false)
 const saving = ref(false)
 const savingCreds = ref(false)
-const savingCaptcha = ref(false)
-const savingRegister = ref(false)
 const error = ref('')
 const okmsg = ref('')
 const username = ref('')
@@ -25,53 +23,9 @@ const credCurrentPassword = ref('')
 const credUsername = ref('')
 const credPassword = ref('')
 const credPassword2 = ref('')
-const captchaProvider = ref('off')
-const captchaApiKey = ref('')
-const captchaApiBase = ref('')
-const captchaTimeout = ref(180)
-const captchaProviders = ref({})
-const captchaDefaultBases = {
-  yescaptcha: 'https://api.yescaptcha.com',
-  '2captcha': 'https://api.2captcha.com',
-  capsolver: 'https://api.capsolver.com',
-}
-const registerInvite = ref('')
-const registerConc = ref('1')
-const registerIntervalMin = ref('8')
-const registerIntervalMax = ref('15')
-const registerOtpSec = ref('180')
-
 const isAdmin = computed(() => isAdminRole(role.value) || consoleBaseFromPath(route.path) === '/admin')
 const keysPath = computed(() => `${consoleBaseFromPath(route.path)}/keys`)
 const uploadPresets = [0, 6, 24, 72, 168]
-const captchaBasePlaceholder = computed(
-  () => captchaDefaultBases[captchaProvider.value] || '留空=当前平台默认端点',
-)
-
-function applyCaptchaProviderFields(provider, bag) {
-  const p = provider || 'off'
-  const fromBag = bag?.providers?.[p]
-  if (fromBag) {
-    captchaApiKey.value = fromBag.api_key || ''
-    captchaApiBase.value = fromBag.api_base || ''
-    return
-  }
-  if (p === (bag?.provider || '')) {
-    captchaApiKey.value = bag?.api_key || ''
-    captchaApiBase.value = bag?.api_base || ''
-    return
-  }
-  captchaApiKey.value = ''
-  captchaApiBase.value = ''
-}
-
-function onCaptchaProviderChange() {
-  applyCaptchaProviderFields(captchaProvider.value, {
-    provider: captchaProvider.value,
-    providers: captchaProviders.value,
-  })
-}
-
 function flashOk(msg) {
   error.value = ''
   okmsg.value = msg
@@ -95,15 +49,6 @@ async function load() {
     const hours = Number(settingsRes.upload_keep_hours)
     uploadKeepHours.value = Number.isFinite(hours) ? Math.max(0, Math.min(720, Math.floor(hours))) : 24
     uploadKeepDraft.value = uploadKeepHours.value
-    captchaProviders.value = settingsRes.captcha?.providers || {}
-    captchaProvider.value = settingsRes.captcha?.provider || 'off'
-    captchaTimeout.value = Number(settingsRes.captcha?.timeout_sec) || 180
-    applyCaptchaProviderFields(captchaProvider.value, settingsRes.captcha)
-    registerInvite.value = settingsRes.register?.invite_code || ''
-    registerConc.value = String(settingsRes.register?.concurrency || '1')
-    registerIntervalMin.value = String(settingsRes.register?.interval_sec_min || '8')
-    registerIntervalMax.value = String(settingsRes.register?.interval_sec_max || '15')
-    registerOtpSec.value = String(settingsRes.register?.otp_timeout_sec || '180')
   } catch (e) {
     flashErr(e)
   } finally {
@@ -151,8 +96,8 @@ async function saveUploadKeep(hours) {
     uploadKeepDraft.value = uploadKeepHours.value
     flashOk(
       uploadKeepHours.value === 0
-        ? '已设为结束后尽快清理：上传文件 / 任务记录 / 注册记录'
-        : `保留 ${uploadKeepHours.value} 小时后清理：上传文件 / 任务记录 / 注册记录`,
+        ? '已设为结束后尽快清理：上传文件 / 任务记录'
+        : `保留 ${uploadKeepHours.value} 小时后清理：上传文件 / 任务记录`,
     )
   } catch (e) {
     flashErr(e)
@@ -161,63 +106,7 @@ async function saveUploadKeep(hours) {
   }
 }
 
-async function saveCaptcha() {
-  if (!isAdmin.value) return
-  savingCaptcha.value = true
-  try {
-    const res = await api.updateSettings({
-      captcha: {
-        provider: captchaProvider.value,
-        api_key: captchaApiKey.value,
-        api_base: captchaApiBase.value,
-        timeout_sec: Number(captchaTimeout.value) || 180,
-      },
-    })
-    captchaProviders.value = res?.captcha?.providers || captchaProviders.value
-    applyCaptchaProviderFields(captchaProvider.value, res?.captcha)
-    const name =
-      captchaProvider.value === 'off'
-        ? '未启用'
-        : captchaProvider.value === 'yescaptcha'
-          ? 'YesCaptcha'
-          : captchaProvider.value === '2captcha'
-            ? '2Captcha'
-            : captchaProvider.value === 'capsolver'
-              ? 'CapSolver'
-              : captchaProvider.value
-    flashOk(`打码设置已保存（${name} 独立 Key/端点）`)
-    await load()
-  } catch (e) {
-    flashErr(e)
-  } finally {
-    savingCaptcha.value = false
-  }
-}
 
-async function saveRegisterDefaults() {
-  if (!isAdmin.value) return
-  savingRegister.value = true
-  try {
-    let minSec = Math.max(0, Number(registerIntervalMin.value) || 0)
-    let maxSec = Math.max(0, Number(registerIntervalMax.value) || 0)
-    if (maxSec < minSec) maxSec = minSec
-    await api.updateSettings({
-      register: {
-        invite_code: registerInvite.value,
-        concurrency: Number(registerConc.value) || 1,
-        interval_sec_min: minSec,
-        interval_sec_max: maxSec,
-        otp_timeout_sec: Number(registerOtpSec.value) || 180,
-      },
-    })
-    flashOk('注册默认参数已保存')
-    await load()
-  } catch (e) {
-    flashErr(e)
-  } finally {
-    savingRegister.value = false
-  }
-}
 
 async function saveAdminCredentials() {
   const current = String(credCurrentPassword.value || '')
@@ -280,8 +169,8 @@ onMounted(load)
         <p class="settings-page-desc">
           {{
             isAdmin
-              ? '按模块分开管理：账号、轮询、打码、注册与清理。'
-              : '账号信息、轮询通道，以及你自己的打码/RH 注册参数（仅作用于你的注册任务）。'
+              ? '按模块分开管理：账号、轮询与清理。'
+              : '账号信息与任务进度轮询通道。'
           }}
         </p>
       </div>
@@ -411,118 +300,7 @@ onMounted(load)
         </div>
       </PagePanel>
 
-      <PagePanel class="settings-card">
-        <header class="settings-card-head">
-          <h3 class="settings-card-title">打码平台</h3>
-          <p class="settings-card-desc">
-            {{
-              isAdmin
-                ? 'Turnstile；各平台 Key 与端点分开保存，切换不会串用（全局默认）'
-                : 'Turnstile；填写你自己的 Key，仅用于你的注册任务（未填时回退管理员全局配置）'
-            }}
-          </p>
-        </header>
-        <div class="settings-cred-grid">
-          <div class="space-y-1.5">
-            <label class="text-sm font-medium text-foreground">平台</label>
-            <select
-              v-model="captchaProvider"
-              class="h-10 w-full rounded-lg border border-border bg-background px-3 text-sm"
-              :disabled="savingCaptcha || loading"
-              @change="onCaptchaProviderChange"
-            >
-              <option value="off">未启用</option>
-              <option value="yescaptcha">YesCaptcha</option>
-              <option value="2captcha">2Captcha</option>
-              <option value="capsolver">CapSolver</option>
-            </select>
-          </div>
-          <div class="space-y-1.5">
-            <label class="text-sm font-medium text-foreground">超时（秒）</label>
-            <Input v-model="captchaTimeout" type="number" size="md" block :disabled="savingCaptcha || loading" />
-          </div>
-          <div class="space-y-1.5 settings-span-2">
-            <label class="text-sm font-medium text-foreground">
-              API Key
-              <span class="ml-1 font-normal text-muted-foreground">（按平台分开保存）</span>
-            </label>
-            <Input
-              v-model="captchaApiKey"
-              type="password"
-              size="md"
-              block
-              placeholder="clientKey"
-              :disabled="savingCaptcha || loading || captchaProvider === 'off'"
-            />
-          </div>
-          <div class="space-y-1.5 settings-span-2">
-            <label class="text-sm font-medium text-foreground">API Base（可空=该平台默认）</label>
-            <Input
-              v-model="captchaApiBase"
-              type="text"
-              size="md"
-              block
-              :placeholder="captchaBasePlaceholder"
-              :disabled="savingCaptcha || loading || captchaProvider === 'off'"
-            />
-          </div>
-        </div>
-        <div class="settings-actions">
-          <Button size="md" variant="primary" :disabled="savingCaptcha || loading" @click="saveCaptcha">
-            {{ savingCaptcha ? '保存中...' : '保存打码设置' }}
-          </Button>
-        </div>
-      </PagePanel>
 
-      <PagePanel class="settings-card">
-        <header class="settings-card-head">
-          <h3 class="settings-card-title">RH 协议注册</h3>
-          <p class="settings-card-desc">
-            {{
-              isAdmin
-                ? '仅 @icloud.com；默认邀请码与并发节奏（全局默认）'
-                : '仅 @icloud.com；你的默认邀请码与并发节奏（仅作用于你的注册任务）'
-            }}
-          </p>
-        </header>
-        <div class="settings-cred-grid">
-          <div class="space-y-1.5 settings-span-2">
-            <label class="text-sm font-medium text-foreground">默认邀请码</label>
-            <Input
-              v-model="registerInvite"
-              type="text"
-              size="md"
-              block
-              placeholder="可选"
-              :disabled="savingRegister || loading"
-            />
-          </div>
-          <div class="space-y-1.5">
-            <label class="text-sm font-medium text-foreground">并发</label>
-            <Input v-model="registerConc" type="number" size="md" block :disabled="savingRegister || loading" />
-          </div>
-          <div class="space-y-1.5">
-            <label class="text-sm font-medium text-foreground">间隔最小秒</label>
-            <Input v-model="registerIntervalMin" type="number" size="md" block :disabled="savingRegister || loading" />
-          </div>
-          <div class="space-y-1.5">
-            <label class="text-sm font-medium text-foreground">间隔最大秒</label>
-            <Input v-model="registerIntervalMax" type="number" size="md" block :disabled="savingRegister || loading" />
-          </div>
-          <div class="space-y-1.5 settings-span-2">
-            <p class="text-xs text-muted-foreground">每个账号成功/失败后，随机等待该秒数范围再开始下一个（避免同邮箱重发码）。</p>
-          </div>
-          <div class="space-y-1.5">
-            <label class="text-sm font-medium text-foreground">OTP 超时秒</label>
-            <Input v-model="registerOtpSec" type="number" size="md" block :disabled="savingRegister || loading" />
-          </div>
-        </div>
-        <div class="settings-actions">
-          <Button size="md" variant="primary" :disabled="savingRegister || loading" @click="saveRegisterDefaults">
-            {{ savingRegister ? '保存中...' : '保存注册参数' }}
-          </Button>
-        </div>
-      </PagePanel>
 
       <PagePanel v-if="isAdmin" class="settings-card">
         <header class="settings-card-head">
@@ -555,7 +333,7 @@ onMounted(load)
         <header class="settings-card-head">
           <h3 class="settings-card-title">自动清理</h3>
           <p class="settings-card-desc">
-            上传文件与已结束任务/注册记录的保留时长（0–720 小时）。「尽快」只清上传文件，不删任务列表。
+            上传文件与已结束任务的保留时长（0–720 小时）。「尽快」只清上传文件，不删任务列表。
           </p>
         </header>
         <div class="settings-poll">
@@ -594,8 +372,8 @@ onMounted(load)
           当前：{{
             uploadKeepHours === 0
               ? '尽快清理上传文件；任务队列记录保留'
-              : `保留 ${uploadKeepHours} 小时后清理上传文件与已结束任务/注册记录`
-          }}。排队/运行中的视频任务与进行中的注册不会删。服务器已临时调回 72h，避免再次清空。
+              : `保留 ${uploadKeepHours} 小时后清理上传文件与已结束任务`
+          }}。排队/运行中的视频任务不会删。
         </p>
       </PagePanel>
 
@@ -604,9 +382,8 @@ onMounted(load)
           <h3 class="settings-card-title">说明</h3>
         </header>
         <ul class="settings-tips">
-          <li>普通用户：自管号池与任务；用个人 API Key 调 <code>/v1/videos</code>；可自配打码/注册参数。</li>
+          <li>普通用户：自管号池与任务；用个人 API Key 调 <code>/v1/videos</code>。</li>
           <li>管理员：可查看/管理全部用户与号池，禁止代提交生视频。</li>
-          <li>RH 协议注册强制 <code>@icloud.com</code>；打码与注册参数分卡保存，用户配置优先于全局。</li>
           <li>首个管理员仅首次用环境变量初始化；之后以后台修改为准。</li>
         </ul>
       </PagePanel>

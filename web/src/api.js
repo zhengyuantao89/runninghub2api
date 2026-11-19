@@ -200,27 +200,4 @@ export const api = {
   disableProxy: (id) => request(`/admin/proxies/${id}/disable`, { method: 'POST' }),
   testProxy: (id) => request(`/admin/proxies/${id}/test`, { method: 'POST' }),
 
-  listMailInboxes: (opts = {}) => {
-    const q = new URLSearchParams()
-    if (opts.status) q.set('status', String(opts.status))
-    if (opts.limit != null) q.set('limit', String(opts.limit))
-    if (opts.offset != null) q.set('offset', String(opts.offset))
-    if (opts.all) q.set('all', '1')
-    const qs = q.toString()
-    return request(`/admin/mail-inboxes${qs ? `?${qs}` : ''}`)
-  },
-  importMailInboxes: (text) =>
-    request('/admin/mail-inboxes', { method: 'POST', body: { text } }),
-  deleteMailInbox: (id) => request(`/admin/mail-inboxes/${id}`, { method: 'DELETE' }),
-  deleteMailInboxes: (ids) =>
-    request('/admin/mail-inboxes', { method: 'DELETE', body: { ids } }),
-  testMailInbox: (id) => request(`/admin/mail-inboxes/${id}/test`, { method: 'POST' }),
-
-  listRegisterJobs: () => request('/admin/register-jobs'),
-  startRegisterJob: (body) => request('/admin/register-jobs', { method: 'POST', body }),
-  clearRegisterJobs: () => request('/admin/register-jobs', { method: 'DELETE' }),
-  getRegisterJobLogs: (id, after = 0) =>
-    request(`/admin/register-jobs/${id}/logs?after=${encodeURIComponent(after || 0)}`),
-  cancelRegisterJob: (id) =>
-    request(`/admin/register-jobs/${id}/cancel`, { method: 'POST' }),
 }
