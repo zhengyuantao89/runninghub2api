@@ -32,10 +32,17 @@ const {
   FREE_VIDEO_MODELS,
   FREE_VIDEO_CREATION_MODES,
   FREE_VIDEO_MULTI_MAX_REFS,
+  FREE_VIDEO_MULTI_MAX_VIDEOS,
+  FREE_VIDEO_MULTI_MAX_AUDIOS,
   freeVideoMode,
   freeVideoModeMeta,
   freeVideoRefCount,
+  freeVideoVideoCount,
+  freeVideoAudioCount,
   freeVideoRefSlots,
+  freeVideoVideoSlots,
+  freeVideoAudioSlots,
+  freeVideoMentionAssets,
   setFreeVideoMode,
   FREE_IMAGE_KEY,
   FREE_IMAGE_MAX_REFS,
@@ -94,6 +101,17 @@ const {
 } = useStudioStore()
 
 const fileInputs = ref({})
+const freePromptEl = ref(null)
+const mentionOpen = ref(false)
+const mentionFilter = ref('')
+const mentionStart = ref(-1)
+
+const mentionChoices = computed(() => {
+  const q = String(mentionFilter.value || '').trim().toLowerCase()
+  const list = freeVideoMentionAssets.value || []
+  if (!q) return list
+  return list.filter((a) => a.label.toLowerCase().includes(q) || a.token.toLowerCase().includes(q))
+})
 
 function onFile(nodeId, e) {
   setImage(nodeId, e.target.files?.[0] || null)
@@ -101,7 +119,17 @@ function onFile(nodeId, e) {
 
 function onDrop(nodeId, e) {
   dragOverKey.value = ''
-  setImage(nodeId, e.dataTransfer?.files?.[0] || null)
+  const files = [...(e.dataTransfer?.files || [])]
+  if (
+    channel.value === 'free' &&
+    freeKind.value === 'video' &&
+    freeVideoMode.value === 'multimodal' &&
+    files.length
+  ) {
+    addPastedImages(files)
+    return
+  }
+  setImage(nodeId, files[0] || null)
 }
 
 function onClearFile(nodeId) {
@@ -110,34 +138,104 @@ function onClearFile(nodeId) {
   if (el) el.value = ''
 }
 
-function collectClipboardImages(clipboardData) {
+function collectClipboardMedia(clipboardData) {
   if (!clipboardData) return []
   const out = []
   const seen = new Set()
   const push = (f) => {
-    if (!f || !String(f.type || '').startsWith('image/')) return
+    if (!f) return
     const key = `${f.type}:${f.size}:${f.name || ''}`
     if (seen.has(key)) return
     seen.add(key)
     out.push(f)
   }
   for (const item of clipboardData.items || []) {
-    if (item?.kind === 'file' && String(item.type || '').startsWith('image/')) {
-      push(item.getAsFile())
-    }
+    if (item?.kind === 'file') push(item.getAsFile())
   }
   for (const f of clipboardData.files || []) push(f)
   return out
 }
 
 function onPromptPaste(e) {
-  const images = collectClipboardImages(e.clipboardData)
-  if (!images.length) return
-  // Keep text paste when mixed; only block default if we consumed images for refs.
-  const added = addPastedImages(images)
+  const files = collectClipboardMedia(e.clipboardData)
+  if (!files.length) return
+  const added = addPastedImages(files)
   if (added > 0) {
     e.preventDefault()
   }
+}
+
+function closeMention() {
+  mentionOpen.value = false
+  mentionFilter.value = ''
+  mentionStart.value = -1
+}
+
+function onFreePromptInput(e) {
+  if (!(channel.value === 'free' && freeKind.value === 'video' && freeVideoMode.value === 'multimodal')) {
+    closeMention()
+    return
+  }
+  const el = e?.target
+  if (!el || typeof el.selectionStart !== 'number') return
+  const val = String(el.value || '')
+  const caret = el.selectionStart
+  const before = val.slice(0, caret)
+  const at = before.lastIndexOf('@')
+  if (at < 0) {
+    closeMention()
+    return
+  }
+  if (at > 0 && /[\w]/.test(before[at - 1] || '')) {
+    closeMention()
+    return
+  }
+  const frag = before.slice(at + 1)
+  if (/[\s\n]/.test(frag) || frag.length > 24) {
+    closeMention()
+    return
+  }
+  mentionStart.value = at
+  mentionFilter.value = frag
+  mentionOpen.value = true
+}
+
+function insertMention(asset) {
+  const el = freePromptEl.value
+  const start = mentionStart.value
+  if (!asset || start < 0) {
+    closeMention()
+    return
+  }
+  const val = String(freePrompt.value || '')
+  const caret = el && typeof el.selectionStart === 'number' ? el.selectionStart : val.length
+  const next = val.slice(0, start) + asset.token + val.slice(caret)
+  freePrompt.value = next
+  closeMention()
+  persist()
+  requestAnimationFrame(() => {
+    if (!el) return
+    const pos = start + asset.token.length
+    el.focus()
+    el.setSelectionRange(pos, pos)
+  })
+}
+
+function onFreePromptKeydown(e) {
+  if (!mentionOpen.value) return
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    closeMention()
+    return
+  }
+  if (e.key === 'Enter' && mentionChoices.value.length) {
+    e.preventDefault()
+    insertMention(mentionChoices.value[0])
+  }
+}
+
+function onFreePromptBlur() {
+  setTimeout(() => closeMention(), 150)
 }
 
 function copy(text) {
@@ -495,49 +593,140 @@ onMounted(async () => {
               </div>
               <p class="studio-sub">{{ freeVideoModeMeta?.hint }}</p>
             </div>
-            <div v-if="freeVideoMode === 'multimodal'" class="studio-field">
-              <div class="studio-field__label-row">
-                <label class="studio-label">参考图</label>
-                <span class="studio-hint">{{ freeVideoRefCount }}/{{ FREE_VIDEO_MULTI_MAX_REFS }}</span>
-              </div>
-              <div class="studio-thumbs">
-                <div
-                  v-for="(key, idx) in freeVideoRefSlots"
-                  :key="key"
-                  class="studio-thumb"
-                  :class="{ 'is-over': dragOverKey === key, 'has-file': !!imagePreviews[key] }"
-                  :title="imageFiles[key]?.name || '添加参考图'"
-                  @dragenter.prevent="dragOverKey = key"
-                  @dragover.prevent="dragOverKey = key"
-                  @dragleave.prevent="dragOverKey = ''"
-                  @drop.prevent="onDrop(key, $event)"
-                  @click="fileInputs[key]?.click()"
-                >
-                  <input
-                    :ref="(el) => { if (el) fileInputs[key] = el }"
-                    type="file"
-                    accept="image/*"
-                    class="sr-only"
-                    @change="onFile(key, $event)"
+            <template v-if="freeVideoMode === 'multimodal'">
+              <div class="studio-field">
+                <div class="studio-field__label-row">
+                  <label class="studio-label">参考图</label>
+                  <span class="studio-hint">{{ freeVideoRefCount }}/{{ FREE_VIDEO_MULTI_MAX_REFS }}</span>
+                </div>
+                <div class="studio-thumbs">
+                  <div
+                    v-for="(key, idx) in freeVideoRefSlots"
+                    :key="key"
+                    class="studio-thumb"
+                    :class="{ 'is-over': dragOverKey === key, 'has-file': !!imagePreviews[key] }"
+                    :title="imageFiles[key]?.name || '添加参考图'"
+                    @dragenter.prevent="dragOverKey = key"
+                    @dragover.prevent="dragOverKey = key"
+                    @dragleave.prevent="dragOverKey = ''"
+                    @drop.prevent="onDrop(key, $event)"
+                    @click="fileInputs[key]?.click()"
                   >
-                  <template v-if="imagePreviews[key]">
-                    <img :src="imagePreviews[key]" alt="" class="studio-thumb__img">
-                    <span class="studio-thumb__idx">{{ idx + 1 }}</span>
-                    <button
-                      type="button"
-                      class="studio-thumb__remove"
-                      aria-label="移除"
-                      @click.stop="onClearFile(key)"
+                    <input
+                      :ref="(el) => { if (el) fileInputs[key] = el }"
+                      type="file"
+                      accept="image/jpeg,image/png,.jpg,.jpeg,.png"
+                      class="sr-only"
+                      @change="onFile(key, $event)"
                     >
-                      ×
-                    </button>
-                  </template>
-                  <template v-else>
-                    <span class="studio-thumb__plus">+</span>
-                  </template>
+                    <template v-if="imagePreviews[key]">
+                      <img :src="imagePreviews[key]" alt="" class="studio-thumb__img">
+                      <span class="studio-thumb__idx">{{ idx + 1 }}</span>
+                      <button
+                        type="button"
+                        class="studio-thumb__remove"
+                        aria-label="移除"
+                        @click.stop="onClearFile(key)"
+                      >
+                        ×
+                      </button>
+                    </template>
+                    <template v-else>
+                      <span class="studio-thumb__plus">+</span>
+                    </template>
+                  </div>
                 </div>
               </div>
-            </div>
+              <div class="studio-field">
+                <div class="studio-field__label-row">
+                  <label class="studio-label">参考视频</label>
+                  <span class="studio-hint">{{ freeVideoVideoCount }}/{{ FREE_VIDEO_MULTI_MAX_VIDEOS }}</span>
+                </div>
+                <div class="studio-thumbs">
+                  <div
+                    v-for="(key, idx) in freeVideoVideoSlots"
+                    :key="key"
+                    class="studio-thumb studio-thumb--media"
+                    :class="{ 'is-over': dragOverKey === key, 'has-file': !!imagePreviews[key] }"
+                    :title="imageFiles[key]?.name || '添加参考视频'"
+                    @dragenter.prevent="dragOverKey = key"
+                    @dragover.prevent="dragOverKey = key"
+                    @dragleave.prevent="dragOverKey = ''"
+                    @drop.prevent="onDrop(key, $event)"
+                    @click="fileInputs[key]?.click()"
+                  >
+                    <input
+                      :ref="(el) => { if (el) fileInputs[key] = el }"
+                      type="file"
+                      accept="video/mp4,.mp4"
+                      class="sr-only"
+                      @change="onFile(key, $event)"
+                    >
+                    <template v-if="imagePreviews[key]">
+                      <video :src="imagePreviews[key]" class="studio-thumb__img" muted />
+                      <span class="studio-thumb__idx">{{ idx + 1 }}</span>
+                      <span class="studio-thumb__kind">MP4</span>
+                      <button
+                        type="button"
+                        class="studio-thumb__remove"
+                        aria-label="移除"
+                        @click.stop="onClearFile(key)"
+                      >
+                        ×
+                      </button>
+                    </template>
+                    <template v-else>
+                      <span class="studio-thumb__plus">+</span>
+                    </template>
+                  </div>
+                </div>
+              </div>
+              <div class="studio-field">
+                <div class="studio-field__label-row">
+                  <label class="studio-label">参考音频</label>
+                  <span class="studio-hint">{{ freeVideoAudioCount }}/{{ FREE_VIDEO_MULTI_MAX_AUDIOS }}</span>
+                </div>
+                <div class="studio-thumbs">
+                  <div
+                    v-for="(key, idx) in freeVideoAudioSlots"
+                    :key="key"
+                    class="studio-thumb studio-thumb--media"
+                    :class="{ 'is-over': dragOverKey === key, 'has-file': !!imagePreviews[key] }"
+                    :title="imageFiles[key]?.name || '添加参考音频'"
+                    @dragenter.prevent="dragOverKey = key"
+                    @dragover.prevent="dragOverKey = key"
+                    @dragleave.prevent="dragOverKey = ''"
+                    @drop.prevent="onDrop(key, $event)"
+                    @click="fileInputs[key]?.click()"
+                  >
+                    <input
+                      :ref="(el) => { if (el) fileInputs[key] = el }"
+                      type="file"
+                      accept="audio/mpeg,audio/wav,audio/x-wav,.mp3,.wav"
+                      class="sr-only"
+                      @change="onFile(key, $event)"
+                    >
+                    <template v-if="imagePreviews[key]">
+                      <div class="studio-thumb__audio">
+                        <span class="studio-thumb__audio-name">{{ imageFiles[key]?.name || 'audio' }}</span>
+                      </div>
+                      <span class="studio-thumb__idx">{{ idx + 1 }}</span>
+                      <button
+                        type="button"
+                        class="studio-thumb__remove"
+                        aria-label="移除"
+                        @click.stop="onClearFile(key)"
+                      >
+                        ×
+                      </button>
+                    </template>
+                    <template v-else>
+                      <span class="studio-thumb__plus">+</span>
+                    </template>
+                  </div>
+                </div>
+              </div>
+            </template>
             <div v-else class="studio-field">
               <div class="studio-field__label-row">
                 <label class="studio-label">参考图（可选）</label>
@@ -628,19 +817,73 @@ onMounted(async () => {
             </div>
           </template>
 
-          <div class="studio-field">
+          <div class="studio-field studio-field--mention">
             <div class="studio-field__label-row">
               <label class="studio-label" for="free-prompt">提示词</label>
-              <span class="studio-hint">可粘贴图片作参考图</span>
+              <span class="studio-hint">
+                {{
+                  freeKind === 'video' && freeVideoMode === 'multimodal'
+                    ? '输入 @ 选择已上传素材'
+                    : '可粘贴图片作参考图'
+                }}
+              </span>
             </div>
             <textarea
               id="free-prompt"
+              ref="freePromptEl"
               v-model="freePrompt"
               rows="4"
               class="studio-textarea"
-              :placeholder="freeKind === 'image' ? '例如：一只在窗边睡觉的猫' : '例如：人物动起来'"
+              :placeholder="
+                freeKind === 'image'
+                  ? '例如：一只在窗边睡觉的猫'
+                  : freeVideoMode === 'multimodal'
+                    ? '例如：@Image 1这个是模特@Video 1这个是参考视频…'
+                    : '例如：人物动起来'
+              "
               @paste="onPromptPaste"
+              @input="onFreePromptInput"
+              @keydown="onFreePromptKeydown"
+              @blur="onFreePromptBlur"
             />
+            <div
+              v-if="mentionOpen && freeKind === 'video' && freeVideoMode === 'multimodal'"
+              class="studio-mention"
+              role="listbox"
+            >
+              <button
+                v-for="a in mentionChoices"
+                :key="a.token"
+                type="button"
+                class="studio-mention__item"
+                role="option"
+                @mousedown.prevent="insertMention(a)"
+              >
+                <span class="studio-mention__thumb" aria-hidden="true">
+                  <img
+                    v-if="a.kind === 'image' && imagePreviews[a.key]"
+                    :src="imagePreviews[a.key]"
+                    alt=""
+                    class="studio-mention__thumb-media"
+                  >
+                  <video
+                    v-else-if="a.kind === 'video' && imagePreviews[a.key]"
+                    :src="imagePreviews[a.key]"
+                    class="studio-mention__thumb-media"
+                    muted
+                    preload="metadata"
+                  />
+                  <span v-else class="studio-mention__thumb-audio">♪</span>
+                </span>
+                <span class="studio-mention__meta">
+                  <span class="studio-mention__token">{{ a.token }}</span>
+                  <span class="studio-mention__name">{{ imageFiles[a.key]?.name || a.label }}</span>
+                </span>
+              </button>
+              <div v-if="!mentionChoices.length" class="studio-mention__empty">
+                {{ freeVideoMentionAssets.length ? '无匹配素材' : '请先上传图/视频/音频' }}
+              </div>
+            </div>
           </div>
 
           <div class="studio-field studio-field--row">
@@ -1190,6 +1433,126 @@ onMounted(async () => {
 .studio-thumb:hover .studio-thumb__remove,
 .studio-thumb:focus-within .studio-thumb__remove {
   opacity: 1;
+}
+
+.studio-thumb__kind {
+  position: absolute;
+  left: 0.28rem;
+  bottom: 0.28rem;
+  padding: 0.1rem 0.3rem;
+  border-radius: 0.25rem;
+  background: hsl(var(--foreground) / 0.7);
+  color: hsl(var(--background));
+  font-size: 0.6rem;
+  font-weight: 600;
+}
+
+.studio-thumb__audio {
+  width: 100%;
+  height: 100%;
+  padding: 0.45rem;
+  display: grid;
+  place-items: center;
+  text-align: center;
+}
+
+.studio-thumb__audio-name {
+  font-size: 0.62rem;
+  line-height: 1.25;
+  color: hsl(var(--muted-foreground));
+  word-break: break-all;
+  max-height: 100%;
+  overflow: hidden;
+}
+
+.studio-field--mention {
+  position: relative;
+}
+
+.studio-mention {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 0.25rem);
+  z-index: 20;
+  max-height: 12rem;
+  overflow: auto;
+  border: 1px solid hsl(var(--border));
+  border-radius: 0.75rem;
+  background: hsl(var(--card));
+  box-shadow: 0 10px 28px hsl(var(--foreground) / 0.08);
+  padding: 0.35rem;
+}
+
+.studio-mention__item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  border: 0;
+  background: transparent;
+  border-radius: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  cursor: pointer;
+  text-align: left;
+  color: hsl(var(--foreground));
+}
+
+.studio-mention__item:hover {
+  background: hsl(var(--muted) / 0.55);
+}
+
+.studio-mention__thumb {
+  flex: 0 0 auto;
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 0.4rem;
+  overflow: hidden;
+  background: hsl(var(--muted) / 0.55);
+  border: 1px solid hsl(var(--border));
+  display: grid;
+  place-items: center;
+}
+
+.studio-mention__thumb-media {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.studio-mention__thumb-audio {
+  font-size: 0.95rem;
+  color: hsl(var(--muted-foreground));
+  line-height: 1;
+}
+
+.studio-mention__meta {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.studio-mention__token {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.studio-mention__name {
+  font-size: 0.7rem;
+  color: hsl(var(--muted-foreground));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.studio-mention__empty {
+  padding: 0.55rem 0.6rem;
+  font-size: 0.75rem;
+  color: hsl(var(--muted-foreground));
 }
 
 .studio-drop {

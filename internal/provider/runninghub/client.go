@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -31,10 +32,46 @@ type APIError struct {
 	Msg    string
 	Status int
 	Data   any
+	Raw    string // truncated response body for diagnostics
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("%s failed: code=%v msg=%s", e.Path, e.Code, e.Msg)
+	if e == nil {
+		return "api error"
+	}
+	parts := []string{fmt.Sprintf("%s failed: http=%d code=%v msg=%s", e.Path, e.Status, e.Code, e.Msg)}
+	if strings.TrimSpace(e.Raw) != "" && e.Msg == "" {
+		parts = append(parts, "raw="+truncate(e.Raw, 160))
+	}
+	return strings.Join(parts, " ")
+}
+
+// IsServerBusy reports RH soft fail「服务器繁忙」(often code=1) — retryable with egress rotate.
+func IsServerBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ae *APIError
+	if errors.As(err, &ae) && ae != nil {
+		if asInt(ae.Code) == 1 {
+			return true
+		}
+		m := strings.ToLower(ae.Msg)
+		if strings.Contains(ae.Msg, "服务器繁忙") || strings.Contains(m, "server busy") || strings.Contains(m, "try again later") {
+			return true
+		}
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "服务器繁忙") || strings.Contains(strings.ToLower(msg), "server busy") || strings.Contains(strings.ToLower(msg), "try again later")
+}
+
+// IsFrequentOperations reports RH code=114 rate limit — rotate egress, don't permanently ban node.
+func IsFrequentOperations(err error) bool {
+	var ae *APIError
+	if errors.As(err, &ae) && asInt(ae.Code) == 114 {
+		return true
+	}
+	return strings.Contains(err.Error(), "FREQUENT") || strings.Contains(err.Error(), "操作过于频繁")
 }
 
 func NewClient(baseURL string) *Client {
@@ -47,7 +84,9 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
-// ApplyIdentity sets anonymous_id + browser fingerprint headers from push payload.
+// ApplyIdentity sets anonymous_id + browser fingerprint headers from push/register payload.
+// Applies muse-style sticky persona fields when present (sec-ch-ua*, sec-fetch-*, Accept-Language…).
+// Does not override Origin/Referer — those stay derived from BaseURL in headers().
 func (c *Client) ApplyIdentity(anonymousID, fingerprintJSON string) {
 	if id := strings.TrimSpace(anonymousID); id != "" {
 		c.AnonymousID = id
@@ -68,10 +107,16 @@ func (c *Client) ApplyIdentity(anonymousID, fingerprintJSON string) {
 	}
 	lang := strings.TrimSpace(asString(fp["lang_full"]))
 	if lang == "" {
+		lang = strings.TrimSpace(asString(fp["accept_language"]))
+	}
+	if lang == "" {
 		lang = strings.TrimSpace(asString(fp["lang"]))
 	}
 	if lang != "" {
 		c.ExtraHeaders["Accept-Language"] = lang
+	}
+	if accept := strings.TrimSpace(asString(fp["accept"])); accept != "" {
+		c.ExtraHeaders["Accept"] = accept
 	}
 	if v := strings.TrimSpace(asString(fp["sec_ch_ua"])); v != "" {
 		c.ExtraHeaders["sec-ch-ua"] = v
@@ -79,6 +124,29 @@ func (c *Client) ApplyIdentity(anonymousID, fingerprintJSON string) {
 		c.ExtraHeaders["sec-ch-ua-platform"] = firstNonEmpty(asString(fp["sec_ch_ua_platform"]), `"Windows"`)
 		if full := strings.TrimSpace(asString(fp["sec_ch_ua_full_version_list"])); full != "" {
 			c.ExtraHeaders["sec-ch-ua-full-version-list"] = full
+		}
+	}
+	if v := strings.TrimSpace(asString(fp["sec_ch_prefers_color_scheme"])); v != "" {
+		c.ExtraHeaders["sec-ch-prefers-color-scheme"] = v
+	}
+	// Browser SPA fetch metadata (muse-aligned). Safe on API XHR.
+	site := firstNonEmpty(asString(fp["sec_fetch_site"]), "same-origin")
+	mode := firstNonEmpty(asString(fp["sec_fetch_mode"]), "cors")
+	dest := firstNonEmpty(asString(fp["sec_fetch_dest"]), "empty")
+	c.ExtraHeaders["Sec-Fetch-Site"] = site
+	c.ExtraHeaders["Sec-Fetch-Mode"] = mode
+	c.ExtraHeaders["Sec-Fetch-Dest"] = dest
+	// Optional Client Hints extras if present in profile.
+	for _, k := range []string{"sec-ch-ua-model", "sec-ch-ua-platform-version", "sec-ch-dpr", "sec-ch-viewport-width", "sec-ch-viewport-height"} {
+		if v := strings.TrimSpace(asString(fp[k])); v != "" {
+			c.ExtraHeaders[k] = v
+		}
+	}
+	if extra, ok := fp["extra"].(map[string]any); ok {
+		for k, rawV := range extra {
+			if v := strings.TrimSpace(asString(rawV)); v != "" {
+				c.ExtraHeaders[k] = v
+			}
 		}
 	}
 }
@@ -110,10 +178,22 @@ func (c *Client) headers(extra map[string]string) http.Header {
 	h.Set("Origin", c.BaseURL)
 	h.Set("Referer", c.BaseURL+"/zh-cn")
 	h.Set("User-Agent", c.UserAgent)
+	// Default SPA fetch metadata when identity did not supply them.
+	if _, ok := c.ExtraHeaders["Sec-Fetch-Site"]; !ok && (c.ExtraHeaders == nil || c.ExtraHeaders["sec-fetch-site"] == "") {
+		h.Set("Sec-Fetch-Site", "same-origin")
+		h.Set("Sec-Fetch-Mode", "cors")
+		h.Set("Sec-Fetch-Dest", "empty")
+	}
 	for k, v := range c.ExtraHeaders {
-		if strings.TrimSpace(v) != "" {
-			h.Set(k, v)
+		if strings.TrimSpace(v) == "" {
+			continue
 		}
+		// Keep Origin/Referer owned by BaseURL.
+		lk := strings.ToLower(k)
+		if lk == "origin" || lk == "referer" {
+			continue
+		}
+		h.Set(k, v)
 	}
 	if c.AccessToken != "" {
 		h.Set("Authorization", "Bearer "+c.AccessToken)
@@ -143,12 +223,23 @@ func (c *Client) postJSON(path string, body any, allowCodes ...int) (map[string]
 	}
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(res.Body)
+	rawStr := string(raw)
 	var decoded map[string]any
 	if err := json.Unmarshal(raw, &decoded); err != nil {
-		return nil, fmt.Errorf("non-json HTTP %d: %s", res.StatusCode, truncate(string(raw), 200))
+		return nil, fmt.Errorf("non-json HTTP %d: %s", res.StatusCode, truncate(rawStr, 200))
+	}
+	apiErr := func() *APIError {
+		return &APIError{
+			Path:   path,
+			Status: res.StatusCode,
+			Code:   decoded["code"],
+			Msg:    firstNonEmpty(asString(decoded["msg"]), asString(decoded["message"]), asString(decoded["error"])),
+			Data:   decoded["data"],
+			Raw:    truncate(rawStr, 240),
+		}
 	}
 	if res.StatusCode >= 400 {
-		return nil, &APIError{Path: path, Status: res.StatusCode, Code: decoded["code"], Msg: asString(decoded["msg"]), Data: decoded["data"]}
+		return nil, apiErr()
 	}
 	code := asInt(decoded["code"])
 	for _, ok := range allowCodes {
@@ -156,7 +247,7 @@ func (c *Client) postJSON(path string, body any, allowCodes ...int) (map[string]
 			return decoded, nil
 		}
 	}
-	return nil, &APIError{Path: path, Status: res.StatusCode, Code: decoded["code"], Msg: asString(decoded["msg"]), Data: decoded["data"]}
+	return nil, apiErr()
 }
 
 func (c *Client) PwdLogin(email, passwordPlain string) (map[string]any, error) {
@@ -164,6 +255,49 @@ func (c *Client) PwdLogin(email, passwordPlain string) (map[string]any, error) {
 		"email":    email,
 		"password": MD5Hex(passwordPlain),
 	})
+}
+
+// GetConfig returns system config (includes turnstileSiteKey).
+func (c *Client) GetConfig() (map[string]any, error) {
+	return c.postJSON("/api/system/getConfig", map[string]any{})
+}
+
+func (c *Client) PageURL(path string) string {
+	p := strings.TrimSpace(path)
+	if p == "" {
+		p = "/zh-cn"
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return strings.TrimRight(c.BaseURL, "/") + p
+}
+
+// SendRegisterCode posts Turnstile token + email. Allow 0/114/1653/1662 for caller branching.
+func (c *Client) SendRegisterCode(email, cfToken string) (map[string]any, error) {
+	return c.postJSON("/uc/email/register/sendCode", map[string]any{
+		"email":   email,
+		"cfToken": cfToken,
+	}, 0, 114, 1653, 1662, 1654, 1656)
+}
+
+// RegisterEmail completes email registration with OTP + md5 password.
+// Body shape matches RH SPA HAR: channel/inviteCode are JSON null when empty
+// (empty string "" is rejected / soft-fails as code=1 服务器繁忙).
+func (c *Client) RegisterEmail(email, code, passwordPlain, inviteCode, deviceID string) (map[string]any, error) {
+	body := map[string]any{
+		"email":          email,
+		"code":           strings.TrimSpace(code),
+		"password":       MD5Hex(passwordPlain),
+		"channel":        nil,
+		"inviteCode":     nil,
+		"regDefaultLang": "zh-CN",
+		"deviceId":       deviceID,
+	}
+	if ic := strings.TrimSpace(inviteCode); ic != "" {
+		body["inviteCode"] = ic
+	}
+	return c.postJSON("/uc/email/register", body)
 }
 
 func (c *Client) GetUserInfo(userID string) (map[string]any, error) {
@@ -331,6 +465,59 @@ func (c *Client) EnsureConsumerApiKey(email, password, accessToken string) (Ensu
 	out.APIKey = key
 	out.Source = source
 	return out, nil
+}
+
+const DefaultHeadIcon = "https://rh-hk-images.xiaoyaoyou.com/default_head_icon.png"
+
+// EditUser updates nickName via multipart /uc/editUser (RH SPA user-setting).
+// HAR sends introduce as the literal string "null" and headIcon as a URL string.
+func (c *Client) EditUser(nickName, headIcon, introduce string) (map[string]any, error) {
+	nickName = strings.TrimSpace(nickName)
+	if nickName == "" {
+		return nil, fmt.Errorf("nickName required")
+	}
+	if strings.TrimSpace(headIcon) == "" {
+		headIcon = DefaultHeadIcon
+	}
+	if introduce == "" {
+		introduce = "null"
+	}
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField("introduce", introduce)
+	_ = w.WriteField("headIcon", headIcon)
+	_ = w.WriteField("nickName", nickName)
+	_ = w.Close()
+
+	req, err := http.NewRequest(http.MethodPost, c.BaseURL+"/uc/editUser", &buf)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = c.headers(map[string]string{
+		"Content-Type": w.FormDataContentType(),
+		"Referer":      c.BaseURL + "/zh-cn/user-setting",
+	})
+	res, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(res.Body)
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil, fmt.Errorf("editUser non-json HTTP %d: %s", res.StatusCode, truncate(string(raw), 200))
+	}
+	if res.StatusCode >= 400 || asInt(decoded["code"]) != 0 {
+		return nil, &APIError{
+			Path:   "/uc/editUser",
+			Status: res.StatusCode,
+			Code:   decoded["code"],
+			Msg:    asString(decoded["msg"]),
+			Data:   decoded["data"],
+			Raw:    truncate(string(raw), 240),
+		}
+	}
+	return decoded, nil
 }
 
 func (c *Client) InstanceAccessAuth() (map[string]any, error) {
@@ -654,6 +841,12 @@ func guessContentType(name string) string {
 		return "image/webp"
 	case ".gif":
 		return "image/gif"
+	case ".mp4":
+		return "video/mp4"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".wav":
+		return "audio/wav"
 	default:
 		return "image/png"
 	}

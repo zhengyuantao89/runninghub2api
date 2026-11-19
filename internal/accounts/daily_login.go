@@ -128,8 +128,9 @@ func (c *DailyLoginClaimer) safeRunAll() {
 	log.Printf("[daily-login] day=%s ok=%d skipped=%d failed=%d gained=%d", day, ok, skip, fail, gained)
 }
 
-// ClaimAll claims daily login coin for active accounts.
-// ids=nil means all active; force ignores last_login_coin_at skip.
+// ClaimAll claims daily login coin for accounts in scope.
+// ids=nil means all accounts (active + disabled); force ignores last_login_coin_at skip.
+// Disabled status only blocks task dispatch — manual/background claim still runs.
 func (c *DailyLoginClaimer) ClaimAll(ids []int64, force bool) ([]DailyClaimResult, error) {
 	return c.ClaimScoped(0, ids, force)
 }
@@ -152,8 +153,9 @@ func (c *DailyLoginClaimer) ClaimScoped(userID int64, ids []int64, force bool) (
 				continue
 			}
 		}
-		// Active accounts, or disabled only for zero balance (claim is how they refill).
-		if a.Status != "active" && !claimableNoCoins(a) {
+		// status=disabled → not dispatchable for video tasks, but claim/ops still allowed.
+		st := strings.ToLower(strings.TrimSpace(a.Status))
+		if st != "" && st != "active" && st != "disabled" {
 			continue
 		}
 		// ListAccounts strips secrets — reload full account
@@ -167,14 +169,6 @@ func (c *DailyLoginClaimer) ClaimScoped(userID int64, ids []int64, force bool) (
 		time.Sleep(400 * time.Millisecond)
 	}
 	return out, nil
-}
-
-func claimableNoCoins(a store.Account) bool {
-	if a.Status != "disabled" {
-		return false
-	}
-	err := strings.TrimSpace(a.LastError)
-	return strings.HasPrefix(err, "NO_COINS")
 }
 
 func (c *DailyLoginClaimer) ClaimOne(acc store.Account, day string, force bool) DailyClaimResult {

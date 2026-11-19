@@ -102,10 +102,13 @@ export const api = {
     if (opts.pageSize != null) q.set('page_size', String(opts.pageSize))
     if (opts.q) q.set('q', String(opts.q))
     if (opts.owner) q.set('owner', String(opts.owner))
+    if (opts.status) q.set('status', String(opts.status))
+    if (opts.dispatch) q.set('dispatch', String(opts.dispatch))
     const qs = q.toString()
     return request(`/admin/accounts${qs ? `?${qs}` : ''}`)
   },
   getAccount: (id) => request(`/admin/accounts/${id}`),
+  updateAccount: (id, body) => request(`/admin/accounts/${id}`, { method: 'PATCH', body }),
   createAccount: (account) => request('/admin/accounts', { method: 'POST', body: account }),
   importAccounts: (accounts) =>
     request('/admin/accounts/import', { method: 'POST', body: { accounts, source: 'manual' } }),
@@ -116,6 +119,12 @@ export const api = {
     request(`/admin/accounts/${id}/ensure-api-key`, { method: 'POST', body: { force: !!force } }),
   ensureAccountsApiKey: (ids, force = false) =>
     request('/admin/accounts/ensure-api-key', { method: 'POST', body: { ids, force: !!force } }),
+  backfillFingerprints: (ids = []) =>
+    request('/admin/accounts/backfill-fingerprint', { method: 'POST', body: { ids } }),
+  editAccountNickname: (id, nick_name = '') =>
+    request(`/admin/accounts/${id}/edit-nickname`, { method: 'POST', body: { nick_name } }),
+  editAccountsNickname: (ids, nick_name = '') =>
+    request('/admin/accounts/edit-nickname', { method: 'POST', body: { ids, nick_name } }),
   claimDailyLogin: (ids = [], force = false) =>
     request('/admin/accounts/claim-daily-login', {
       method: 'POST',
@@ -123,12 +132,22 @@ export const api = {
     }),
   disableAccount: (id) => request(`/admin/accounts/${id}/disable`, { method: 'POST' }),
   enableAccount: (id) => request(`/admin/accounts/${id}/enable`, { method: 'POST' }),
+  clearAccountCooldown: (id) => request(`/admin/accounts/${id}/clear-cooldown`, { method: 'POST' }),
   setAccountMaxConcurrency: (id, max_concurrency) =>
     request(`/admin/accounts/${id}/max-concurrency`, {
       method: 'POST',
       body: { max_concurrency: Number(max_concurrency) || 1 },
     }),
-  listAdminTasks: () => request('/admin/tasks'),
+  listAdminTasks: (opts = {}) => {
+    const q = new URLSearchParams()
+    if (opts.page != null) q.set('page', String(opts.page))
+    if (opts.pageSize != null) q.set('page_size', String(opts.pageSize))
+    if (opts.owner) q.set('owner', String(opts.owner))
+    if (opts.q) q.set('q', String(opts.q))
+    if (opts.status) q.set('status', String(opts.status))
+    const qs = q.toString()
+    return request(`/admin/tasks${qs ? `?${qs}` : ''}`)
+  },
   listVideos: () => request('/v1/videos'),
   getVideo: (id) => request(`/v1/videos/${id}`),
   cancelVideo: (id) => request(`/v1/videos/${id}/cancel`, { method: 'POST' }),
@@ -180,4 +199,28 @@ export const api = {
   enableProxy: (id) => request(`/admin/proxies/${id}/enable`, { method: 'POST' }),
   disableProxy: (id) => request(`/admin/proxies/${id}/disable`, { method: 'POST' }),
   testProxy: (id) => request(`/admin/proxies/${id}/test`, { method: 'POST' }),
+
+  listMailInboxes: (opts = {}) => {
+    const q = new URLSearchParams()
+    if (opts.status) q.set('status', String(opts.status))
+    if (opts.limit != null) q.set('limit', String(opts.limit))
+    if (opts.offset != null) q.set('offset', String(opts.offset))
+    if (opts.all) q.set('all', '1')
+    const qs = q.toString()
+    return request(`/admin/mail-inboxes${qs ? `?${qs}` : ''}`)
+  },
+  importMailInboxes: (text) =>
+    request('/admin/mail-inboxes', { method: 'POST', body: { text } }),
+  deleteMailInbox: (id) => request(`/admin/mail-inboxes/${id}`, { method: 'DELETE' }),
+  deleteMailInboxes: (ids) =>
+    request('/admin/mail-inboxes', { method: 'DELETE', body: { ids } }),
+  testMailInbox: (id) => request(`/admin/mail-inboxes/${id}/test`, { method: 'POST' }),
+
+  listRegisterJobs: () => request('/admin/register-jobs'),
+  startRegisterJob: (body) => request('/admin/register-jobs', { method: 'POST', body }),
+  clearRegisterJobs: () => request('/admin/register-jobs', { method: 'DELETE' }),
+  getRegisterJobLogs: (id, after = 0) =>
+    request(`/admin/register-jobs/${id}/logs?after=${encodeURIComponent(after || 0)}`),
+  cancelRegisterJob: (id) =>
+    request(`/admin/register-jobs/${id}/cancel`, { method: 'POST' }),
 }

@@ -17,31 +17,28 @@ type sessionInfo struct {
 	ExpiresAt time.Time
 }
 
+// sessionStore persists login tokens in SQLite so Docker/process restarts keep sessions.
 type sessionStore struct {
-	mu   sync.Mutex
-	byID map[string]sessionInfo
-	ttl  time.Duration
+	mu    sync.Mutex
+	store *store.Store
+	ttl   time.Duration
 }
 
-func newSessionStore(ttl time.Duration) *sessionStore {
+func newSessionStore(st *store.Store, ttl time.Duration) *sessionStore {
 	if ttl <= 0 {
 		ttl = 7 * 24 * time.Hour
 	}
-	return &sessionStore{byID: map[string]sessionInfo{}, ttl: ttl}
+	return &sessionStore{store: st, ttl: ttl}
 }
 
 func (s *sessionStore) Create(u store.User) string {
 	b := make([]byte, 24)
 	_, _ = rand.Read(b)
 	id := hex.EncodeToString(b)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.purgeLocked(time.Now())
-	s.byID[id] = sessionInfo{
-		UserID:    u.ID,
-		Username:  u.Username,
-		Role:      u.Role,
-		ExpiresAt: time.Now().Add(s.ttl),
+	exp := time.Now().Add(s.ttl)
+	_ = s.store.PurgeExpiredUserSessions()
+	if err := s.store.CreateUserSession(id, u.ID, u.Username, u.Role, exp); err != nil {
+		return ""
 	}
 	return id
 }
@@ -53,19 +50,23 @@ func (s *sessionStore) Get(id string) (sessionInfo, bool) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	row, err := s.store.GetUserSession(id)
+	if err != nil {
+		return sessionInfo{}, false
+	}
 	now := time.Now()
-	s.purgeLocked(now)
-	info, ok := s.byID[id]
-	if !ok {
+	if now.After(row.ExpiresAt) {
+		_ = s.store.DeleteUserSession(id)
 		return sessionInfo{}, false
 	}
-	if now.After(info.ExpiresAt) {
-		delete(s.byID, id)
-		return sessionInfo{}, false
-	}
-	info.ExpiresAt = now.Add(s.ttl)
-	s.byID[id] = info
-	return info, true
+	exp := now.Add(s.ttl)
+	_ = s.store.TouchUserSession(id, exp)
+	return sessionInfo{
+		UserID:    row.UserID,
+		Username:  row.Username,
+		Role:      row.Role,
+		ExpiresAt: exp,
+	}, true
 }
 
 func (s *sessionStore) Valid(id string) bool {
@@ -78,15 +79,5 @@ func (s *sessionStore) Revoke(id string) {
 	if id == "" {
 		return
 	}
-	s.mu.Lock()
-	delete(s.byID, id)
-	s.mu.Unlock()
-}
-
-func (s *sessionStore) purgeLocked(now time.Time) {
-	for id, exp := range s.byID {
-		if now.After(exp.ExpiresAt) {
-			delete(s.byID, id)
-		}
-	}
+	_ = s.store.DeleteUserSession(id)
 }

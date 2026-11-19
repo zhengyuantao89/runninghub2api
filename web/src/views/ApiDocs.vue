@@ -39,9 +39,12 @@ const sections = computed(() => [
   nano-banana2-low-cost          Nano Banana2-Low-Cost
   gpt-image-2-low-cost           GPT Image2.0-Low-Cost
 
-生视频（默认异步）
+生视频（默认异步 · 官方试用 Minimax H3-RH Enhanced）
   minimax-h3-rh-enhanced              自由创作（文生/图生）
-  minimax-h3-rh-enhanced-multimodal   多模态参考（最多 9 张）`,
+  minimax-h3-rh-enhanced-multimodal   多模态参考（图≤9 / 视频≤3 / 音频≤3）
+
+生视频常用参数：duration(4–15)、aspect_ratio（见「生视频」页完整列表）、
+resolution=480p|768p|1080p（默认 480p，高清请传 1080p）`,
       },
     ],
   },
@@ -50,7 +53,7 @@ const sections = computed(() => [
     tab: '生图',
     group: 'OpenAI',
     title: 'OpenAI 兼容 · 生图',
-    desc: 'POST /v1/images/generations。默认同步等到出图；async=true 则返回任务 id，再 GET /v1/images/{id}。',
+    desc: 'POST /v1/images/generations。默认同步等到出图（取 data[0].url）；async=true 立刻返回 id，再 GET /v1/images/{id}。',
     examples: [
       {
         label: '同步生图',
@@ -63,8 +66,20 @@ const sections = computed(() => [
     "prompt": "一只在窗边睡觉的猫，柔和光线",
     "size": "9:16",
     "quality": "1k"
-  }'
-# → data[0].url`,
+  }'`,
+      },
+      {
+        label: '同步 · 成功响应',
+        lang: 'json',
+        code: `{
+  "created": 1731744000,
+  "data": [{ "url": "https://.../output/image/xxx.png" }],
+  "id": "vid_c1cabb93e76f",
+  "object": "list",
+  "mode": "sync",
+  "model": "nano-banana2-low-cost",
+  "status": "succeeded"
+}`,
       },
       {
         label: '异步生图',
@@ -72,10 +87,52 @@ const sections = computed(() => [
         code: `curl -s -X POST "${base.value}/v1/images/generations?async=1" \\
   -H "Authorization: Bearer ${apiKey.value}" \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"gpt-image-2-low-cost","prompt":"水彩小猫"}'
-
-curl -s ${base.value}/v1/images/<id> \\
-  -H "Authorization: Bearer ${apiKey.value}"`,
+  -d '{"model":"gpt-image-2-low-cost","prompt":"水彩小猫"}'`,
+      },
+      {
+        label: '异步创建 · 响应',
+        lang: 'json',
+        code: `{
+  "id": "vid_a1b2c3d4e5f6",
+  "object": "image.generation",
+  "created": 1731744120,
+  "status": "queued",
+  "mode": "async",
+  "model": "gpt-image-2-low-cost",
+  "rh_task_id": "",
+  "message": "async: poll GET /v1/images/vid_a1b2c3d4e5f6"
+}`,
+      },
+      {
+        label: '轮询查询',
+        lang: 'bash',
+        code: `curl -s ${base.value}/v1/images/vid_a1b2c3d4e5f6 \\
+  -H "Authorization: Bearer ${apiKey.value}"
+# 直到 status=succeeded，取 data[0].url 或 url`,
+      },
+      {
+        label: '查询 · 完成',
+        lang: 'json',
+        code: `{
+  "id": "vid_a1b2c3d4e5f6",
+  "object": "image.generation",
+  "created": 1731744120,
+  "status": "succeeded",
+  "mode": "async",
+  "progress_text": "完成",
+  "rh_task_id": "2118246629706653701",
+  "data": [{ "url": "https://.../output/image/xxx.png" }],
+  "url": "https://.../output/image/xxx.png"
+}`,
+      },
+      {
+        label: '参考图（图生图）',
+        lang: 'bash',
+        code: `curl -s -X POST ${base.value}/v1/images/generations \\
+  -H "Authorization: Bearer ${apiKey.value}" \\
+  -F model=gpt-image-2-low-cost \\
+  -F prompt='保持构图，换成水彩风格' \\
+  -F image=@./ref.png`,
       },
     ],
   },
@@ -83,25 +140,139 @@ curl -s ${base.value}/v1/images/<id> \\
     id: 'openai-videos',
     tab: '生视频',
     group: 'OpenAI',
-    title: 'OpenAI 兼容 · 生视频',
-    desc: 'POST /v1/videos + model。默认异步；sync=true 可阻塞到成片。应用模板仍用 webapp_id。',
+    title: 'OpenAI 兼容 · 生视频（官方试用）',
+    desc: 'POST /v1/videos + model（Minimax H3-RH Enhanced）。默认异步立刻返回 id；sync=true 可阻塞到成片。查询 GET 取 file_url。不要传应用模板的 webapp_id/node_info_list。',
     examples: [
       {
-        label: '异步生视频',
+        label: '参数一览（官方试用模型）',
+        lang: 'text',
+        code: `字段              必填   说明
+model             是    minimax-h3-rh-enhanced（自由创作：无图=文生，有图=图生）
+                        minimax-h3-rh-enhanced-multimodal（多模态）
+prompt            是    正向提示词，最长约 20000
+duration/seconds  否    时长秒数 4–15，默认 4
+aspect_ratio/size 否    画面比例（见下一栏），默认 3:2 (Photo)
+resolution        否    480p / 768p / 1080p；不传默认 480p（很糊），高清请传 1080p
+image             图生  首帧 JPG/PNG（multipart）或 JSON 的 image_base64
+video / audio     多模态 参考视频≤3、音频≤3；参考图≤9
+
+aspect_ratio / size 可选值（与官网试用模型一致，推荐原样带标签）：
+  1:1 (Square)
+  2:3 (Portrait Photo)
+  3:2 (Photo)
+  3:4 (Portrait Standard)
+  4:3 (Standard)
+  9:16 (Portrait Widescreen)
+  16:9 (Widescreen)
+  21:9 (Ultrawide)
+也可传纯比例如 3:4 / 9:16。
+
+网关内部固定 audioMode=native（暂不开放下游改）。`,
+      },
+      {
+        label: '图生视频（推荐 · 全参数）',
+        lang: 'bash',
+        code: `curl -s -X POST ${base.value}/v1/videos \\
+  -H "Authorization: Bearer ${apiKey.value}" \\
+  -F model=minimax-h3-rh-enhanced \\
+  -F prompt='人物按首帧外貌缓慢转身，写实风格' \\
+  -F duration=10 \\
+  -F aspect_ratio='3:4 (Portrait Standard)' \\
+  -F resolution=1080p \\
+  -F image=@./first_frame.png`,
+      },
+      {
+        label: '文生视频（JSON）',
         lang: 'bash',
         code: `curl -s -X POST ${base.value}/v1/videos \\
   -H "Authorization: Bearer ${apiKey.value}" \\
   -H "Content-Type: application/json" \\
   -d '{
     "model": "minimax-h3-rh-enhanced",
-    "prompt": "人物动起来",
-    "seconds": "4",
-    "size": "3:2 (Photo)"
-  }'
-
-curl -s ${base.value}/v1/videos/<id> \\
+    "prompt": "阳光下女孩缓缓转身，写实风格",
+    "duration": "8",
+    "aspect_ratio": "9:16 (Portrait Widescreen)",
+    "resolution": "1080p"
+  }'`,
+      },
+      {
+        label: '异步创建 · 响应',
+        lang: 'json',
+        code: `{
+  "id": "vid_c1cabb93e76f",
+  "object": "video",
+  "created_at": 1731744000,
+  "status": "queued",
+  "mode": "async",
+  "model": "minimax-h3-rh-enhanced",
+  "rh_task_id": "",
+  "progress": 0,
+  "message": "async: poll GET /v1/videos/vid_c1cabb93e76f"
+}`,
+      },
+      {
+        label: '轮询查询',
+        lang: 'bash',
+        code: `curl -s ${base.value}/v1/videos/vid_c1cabb93e76f \\
   -H "Authorization: Bearer ${apiKey.value}"
 # 直到 status=succeeded，取 file_url`,
+      },
+      {
+        label: '查询 · 进行中',
+        lang: 'json',
+        code: `{
+  "id": "vid_c1cabb93e76f",
+  "status": "running",
+  "rh_task_id": "2118246629706653697",
+  "rh_status": "RUNNING",
+  "progress_text": "生成中",
+  "model": "minimax-h3-rh-enhanced",
+  "file_url": "",
+  "preview_url": "",
+  "created_at": "2026-11-16T15:00:00Z",
+  "updated_at": "2026-11-16T15:01:20Z"
+}`,
+      },
+      {
+        label: '查询 · 完成',
+        lang: 'json',
+        code: `{
+  "id": "vid_c1cabb93e76f",
+  "status": "succeeded",
+  "rh_task_id": "2118246629706653697",
+  "progress_text": "完成",
+  "file_url": "https://.../output/video/xxx.mp4",
+  "preview_url": "https://.../preview.jpg",
+  "finished_at": "2026-11-16T15:02:10Z"
+}`,
+      },
+      {
+        label: '同步生视频（阻塞到成片）',
+        lang: 'bash',
+        code: `curl -s -X POST "${base.value}/v1/videos?sync=1" \\
+  -H "Authorization: Bearer ${apiKey.value}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "minimax-h3-rh-enhanced",
+    "prompt": "人物动起来",
+    "duration": "8",
+    "aspect_ratio": "3:4 (Portrait Standard)",
+    "resolution": "1080p"
+  }'`,
+      },
+      {
+        label: '同步 · 成功响应',
+        lang: 'json',
+        code: `{
+  "id": "vid_c1cabb93e76f",
+  "object": "video",
+  "created_at": 1731744000,
+  "status": "completed",
+  "mode": "sync",
+  "progress": 100,
+  "model": "minimax-h3-rh-enhanced",
+  "url": "https://.../output/video/xxx.mp4"
+}`,
       },
       {
         label: '多模态参考',
@@ -109,10 +280,28 @@ curl -s ${base.value}/v1/videos/<id> \\
         code: `curl -s -X POST ${base.value}/v1/videos \\
   -H "Authorization: Bearer ${apiKey.value}" \\
   -F model=minimax-h3-rh-enhanced-multimodal \\
-  -F prompt='人物动起来' \\
-  -F seconds=4 \\
-  -F image=@./a.png \\
-  -F image_2=@./b.png`,
+  -F prompt='@Image 1这个是模特@Video 1这个是参考视频@Audio 1这个是口播音频，请根据参考视频和口播音频帮我复刻一个' \\
+  -F duration=10 \\
+  -F aspect_ratio='3:4 (Portrait Standard)' \\
+  -F resolution=1080p \\
+  -F image=@./model.png \\
+  -F video=@./ref.mp4 \\
+  -F audio=@./voice.wav`,
+      },
+      {
+        label: '多模态 · 创建响应（同异步）',
+        lang: 'json',
+        code: `{
+  "id": "vid_a1b2c3d4e5f6",
+  "object": "video",
+  "created_at": 1731744120,
+  "status": "in_progress",
+  "mode": "async",
+  "model": "minimax-h3-rh-enhanced-multimodal",
+  "rh_task_id": "2118246629706653701",
+  "progress": 0,
+  "message": "async: poll GET /v1/videos/vid_a1b2c3d4e5f6"
+}`,
       },
     ],
   },

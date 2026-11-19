@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/trae/runninghub2api/internal/config"
 	"github.com/trae/runninghub2api/internal/egress"
 	"github.com/trae/runninghub2api/internal/provider/runninghub"
+	"github.com/trae/runninghub2api/internal/register"
 	"github.com/trae/runninghub2api/internal/store"
 	"github.com/trae/runninghub2api/internal/tasks"
 )
@@ -32,6 +34,7 @@ type Server struct {
 	worker       *tasks.Worker
 	dailyClaimer *accounts.DailyLoginClaimer
 	egress       *egress.Manager
+	register     *register.Service
 	mux          *http.ServeMux
 	sessions     *sessionStore
 }
@@ -44,8 +47,9 @@ func New(cfg config.Config, st *store.Store, pool *accounts.Pool, worker *tasks.
 		worker:       worker,
 		dailyClaimer: dailyClaimer,
 		egress:       egress.NewManager(st),
+		register:     register.NewService(st, cfg.BaseURL),
 		mux:          http.NewServeMux(),
-		sessions:     newSessionStore(7 * 24 * time.Hour),
+		sessions:     newSessionStore(st, 7*24*time.Hour),
 	}
 	s.routes()
 	return s
@@ -96,6 +100,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/webapps/", s.withActor(s.handleWebappByID))
 	s.mux.HandleFunc("/admin/accounts/import", s.withActor(s.handleImportAccounts))
 	s.mux.HandleFunc("/admin/accounts/ensure-api-key", s.withActor(s.handleEnsureAPIKeys))
+	s.mux.HandleFunc("/admin/accounts/backfill-fingerprint", s.withActor(s.handleBackfillFingerprints))
+	s.mux.HandleFunc("/admin/accounts/edit-nickname", s.withActor(s.handleEditNicknames))
 	s.mux.HandleFunc("/admin/accounts/claim-daily-login", s.withActor(s.handleClaimDailyLogin))
 	s.mux.HandleFunc("/admin/accounts/", s.withActor(s.handleAdminAccountByID))
 	s.mux.HandleFunc("/admin/accounts", s.withActor(s.handleAdminAccounts))
@@ -108,6 +114,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/proxies/subscriptions", s.withAdmin(s.handleProxySubscriptions))
 	s.mux.HandleFunc("/admin/proxies/", s.withAdmin(s.handleAdminProxyByID))
 	s.mux.HandleFunc("/admin/proxies", s.withAdmin(s.handleAdminProxies))
+	s.mux.HandleFunc("/admin/mail-inboxes/", s.withActor(s.handleMailInboxByID))
+	s.mux.HandleFunc("/admin/mail-inboxes", s.withActor(s.handleMailInboxes))
+	s.mux.HandleFunc("/admin/register-jobs/", s.withActor(s.handleRegisterJobByID))
+	s.mux.HandleFunc("/admin/register-jobs", s.withActor(s.handleRegisterJobs))
 
 	// 普通用户可用个人 API Key 推送到自己的号池；管理员可指定 user_id。
 	s.mux.HandleFunc("/admin/sync/accounts", s.withActor(s.handlePushAccounts))
@@ -192,6 +202,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := s.sessions.Create(u)
+	if token == "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "创建会话失败"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token":    token,
 		"username": u.Username,
@@ -234,6 +248,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := s.sessions.Create(u)
+	if token == "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "创建会话失败"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token":    token,
 		"username": u.Username,
@@ -292,21 +310,30 @@ func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 	a, _ := actorFromRequest(r)
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{
-			"poll_auth":               s.resolvePollAuth(),
-			"poll_auth_default":       config.NormalizePollAuth(s.cfg.PollAuth),
-			"registration_enabled":    s.store.RegistrationEnabled(),
-			"upload_keep_hours":       s.store.UploadKeepHours(s.cfg.UploadKeepHours),
+		out := map[string]any{
+			"poll_auth":                 s.resolvePollAuth(),
+			"poll_auth_default":         config.NormalizePollAuth(s.cfg.PollAuth),
+			"registration_enabled":      s.store.RegistrationEnabled(),
+			"upload_keep_hours":         s.store.UploadKeepHours(s.cfg.UploadKeepHours),
 			"upload_keep_hours_default": store.NormalizeUploadKeepHours(s.cfg.UploadKeepHours),
-			"role":                    a.Role,
-		})
+			"role":                      a.Role,
+		}
+		for k, v := range s.captchaSettingsViewFor(a.UserID, a.IsAdmin()) {
+			out[k] = v
+		}
+		writeJSON(w, http.StatusOK, out)
 	case http.MethodPut, http.MethodPost:
+		rawBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body"})
+			return
+		}
 		var body struct {
 			PollAuth            *string `json:"poll_auth"`
 			RegistrationEnabled *bool   `json:"registration_enabled"`
 			UploadKeepHours     *int    `json:"upload_keep_hours"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := json.Unmarshal(rawBody, &body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
 			return
 		}
@@ -341,6 +368,34 @@ func (s *Server) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			out["upload_keep_hours"] = hours
+		}
+		var rawMap map[string]json.RawMessage
+		_ = json.Unmarshal(rawBody, &rawMap)
+		if _, hasCap := rawMap["captcha"]; hasCap {
+			if err := s.applyCaptchaRegisterSettingsFor(a.UserID, rawMap, a.IsAdmin()); err != nil {
+				writeJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+				return
+			}
+			for k, v := range s.captchaSettingsViewFor(a.UserID, a.IsAdmin()) {
+				out[k] = v
+			}
+		} else if _, hasReg := rawMap["register"]; hasReg {
+			if err := s.applyCaptchaRegisterSettingsFor(a.UserID, rawMap, a.IsAdmin()); err != nil {
+				writeJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+				return
+			}
+			for k, v := range s.captchaSettingsViewFor(a.UserID, a.IsAdmin()) {
+				out[k] = v
+			}
+		} else if _, hasEg := rawMap["egress"]; hasEg {
+			if !a.IsAdmin() {
+				writeJSON(w, http.StatusForbidden, map[string]any{"error": "仅管理员可改出口模式"})
+				return
+			}
+			_ = s.applyCaptchaRegisterSettingsFor(a.UserID, rawMap, true)
+			for k, v := range s.captchaSettingsViewFor(a.UserID, true) {
+				out[k] = v
+			}
 		}
 		writeJSON(w, http.StatusOK, out)
 	default:
@@ -435,10 +490,17 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 	var imagePath string
 	var nodeInfoList []runninghub.NodeInput
 	extraImages := map[string][]byte{}
+	extraVideos := map[string][]byte{} // key -> bytes; filename kept via key suffix or companion
+	extraAudios := map[string][]byte{}
+	extraVideoNames := map[string]string{}
+	extraAudioNames := map[string]string{}
+	var videoURLs []string
+	var audioURLs []string
 
 	ct := r.Header.Get("Content-Type")
 	if strings.HasPrefix(ct, "multipart/form-data") {
-		if err := r.ParseMultipartForm(64 << 20); err != nil {
+		// Official multimodal allows ~100MB/file (video); keep headroom for several parts.
+		if err := r.ParseMultipartForm(512 << 20); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
@@ -516,18 +578,36 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 		}
 		if r.MultipartForm != nil {
 			for key, files := range r.MultipartForm.File {
-				if !strings.HasPrefix(key, "image_") || len(files) == 0 {
+				if len(files) == 0 {
 					continue
 				}
-				nodeID := strings.TrimPrefix(key, "image_")
-				f, err := files[0].Open()
+				fh := files[0]
+				f, err := fh.Open()
 				if err != nil {
 					continue
 				}
 				b, _ := io.ReadAll(f)
 				f.Close()
-				if len(b) > 0 {
-					extraImages[nodeID] = b
+				if len(b) == 0 {
+					continue
+				}
+				switch {
+				case strings.HasPrefix(key, "image_"):
+					extraImages[strings.TrimPrefix(key, "image_")] = b
+				case key == "video" || strings.HasPrefix(key, "video_"):
+					id := "1"
+					if key != "video" {
+						id = strings.TrimPrefix(key, "video_")
+					}
+					extraVideos[id] = b
+					extraVideoNames[id] = fh.Filename
+				case key == "audio" || strings.HasPrefix(key, "audio_"):
+					id := "1"
+					if key != "audio" {
+						id = strings.TrimPrefix(key, "audio_")
+					}
+					extraAudios[id] = b
+					extraAudioNames[id] = fh.Filename
 				}
 			}
 		}
@@ -537,6 +617,9 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 			ImagePath      string                 `json:"image_path"`
 			ImageBase64    string                 `json:"image_base64"`
 			ImagesBase64   map[string]string      `json:"images_base64"`
+			ImageURLs      []string               `json:"image_urls"`
+			VideoURLs      []string               `json:"video_urls"`
+			AudioURLs      []string               `json:"audio_urls"`
 			WebappID       string                 `json:"webapp_id"`
 			TemplateID     string                 `json:"template_id"`
 			Duration       string                 `json:"duration"`
@@ -612,6 +695,27 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			extraImages[strings.TrimSpace(nodeID)] = raw
+		}
+		for _, u := range body.ImageURLs {
+			u = strings.TrimSpace(u)
+			if strings.HasPrefix(u, "http") {
+				nodeInfoList = append(nodeInfoList, runninghub.NodeInput{
+					NodeID: fmt.Sprintf("qc_ref_image_url_%d", len(nodeInfoList)+1),
+					FieldName: "image", FieldType: "IMAGE", FieldValue: u,
+				})
+			}
+		}
+		for _, u := range body.VideoURLs {
+			u = strings.TrimSpace(u)
+			if strings.HasPrefix(u, "http") {
+				videoURLs = append(videoURLs, u)
+			}
+		}
+		for _, u := range body.AudioURLs {
+			u = strings.TrimSpace(u)
+			if strings.HasPrefix(u, "http") {
+				audioURLs = append(audioURLs, u)
+			}
 		}
 	}
 
@@ -708,8 +812,15 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 			imgCount++
 		}
 		imgCount += len(extraImages)
-		if mode == runninghub.QCFreeVideoModeMultimodal && imgCount == 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "多模态参考至少需要一张参考图"})
+		mediaCount := imgCount + len(extraVideos) + len(extraAudios) + len(videoURLs) + len(audioURLs)
+		for _, n := range nodeInfoList {
+			ft := strings.ToUpper(strings.TrimSpace(n.FieldType))
+			if ft == "IMAGE" || ft == "VIDEO" || ft == "AUDIO" {
+				mediaCount++
+			}
+		}
+		if mode == runninghub.QCFreeVideoModeMultimodal && mediaCount == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "多模态参考至少需要一个参考素材（图/视频/音频）"})
 			return
 		}
 		bid, sid, resolvedMode := runninghub.ResolveQCFreeVideoModel(mode, imgCount)
@@ -720,11 +831,11 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 			qcParams = map[string]any{}
 		}
 		qcParams["free_video_mode"] = resolvedMode
+		uploadsDir := filepath.Join(s.cfg.DataDir, "uploads")
+		_ = os.MkdirAll(uploadsDir, 0o755)
+		extraNodes := make([]runninghub.NodeInput, 0, len(extraImages)+len(extraVideos)+len(extraAudios)+len(videoURLs)+len(audioURLs))
 		// Persist extra local images for multimodal / queued worker.
 		if len(extraImages) > 0 {
-			uploadsDir := filepath.Join(s.cfg.DataDir, "uploads")
-			_ = os.MkdirAll(uploadsDir, 0o755)
-			extraNodes := make([]runninghub.NodeInput, 0, len(extraImages))
 			i := 0
 			for key, raw := range extraImages {
 				if len(raw) == 0 {
@@ -742,10 +853,68 @@ func (s *Server) createVideo(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				extraNodes = append(extraNodes, runninghub.NodeInput{
-					NodeID: fmt.Sprintf("qc_ref_%d", i), FieldName: "image", FieldType: "IMAGE", FieldValue: dst,
+					NodeID: fmt.Sprintf("qc_ref_image_%d", i), FieldName: "image", FieldType: "IMAGE", FieldValue: dst,
 				})
 			}
-			nodeInfoList = extraNodes
+		}
+		vi := 0
+		for _, key := range sortedMapKeys(extraVideos) {
+			raw := extraVideos[key]
+			if len(raw) == 0 {
+				continue
+			}
+			vi++
+			orig := extraVideoNames[key]
+			ext := filepath.Ext(orig)
+			if runninghub.ClassifyMediaKind(orig, "") != runninghub.MediaKindVideo {
+				ext = ".mp4"
+			}
+			name := time.Now().Format("20060102_150405") + "_qcvideo_" + sanitizeName(key) + ext
+			dst := filepath.Join(uploadsDir, name)
+			if err := os.WriteFile(dst, raw, 0o644); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			extraNodes = append(extraNodes, runninghub.NodeInput{
+				NodeID: fmt.Sprintf("qc_ref_video_%d", vi), FieldName: "video", FieldType: "VIDEO", FieldValue: dst,
+			})
+		}
+		for _, u := range videoURLs {
+			vi++
+			extraNodes = append(extraNodes, runninghub.NodeInput{
+				NodeID: fmt.Sprintf("qc_ref_video_%d", vi), FieldName: "video", FieldType: "VIDEO", FieldValue: u,
+			})
+		}
+		ai := 0
+		for _, key := range sortedMapKeys(extraAudios) {
+			raw := extraAudios[key]
+			if len(raw) == 0 {
+				continue
+			}
+			ai++
+			orig := extraAudioNames[key]
+			ext := filepath.Ext(orig)
+			if runninghub.ClassifyMediaKind(orig, "") != runninghub.MediaKindAudio {
+				ext = ".wav"
+			}
+			name := time.Now().Format("20060102_150405") + "_qcaudio_" + sanitizeName(key) + ext
+			dst := filepath.Join(uploadsDir, name)
+			if err := os.WriteFile(dst, raw, 0o644); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			extraNodes = append(extraNodes, runninghub.NodeInput{
+				NodeID: fmt.Sprintf("qc_ref_audio_%d", ai), FieldName: "audio", FieldType: "AUDIO", FieldValue: dst,
+			})
+		}
+		for _, u := range audioURLs {
+			ai++
+			extraNodes = append(extraNodes, runninghub.NodeInput{
+				NodeID: fmt.Sprintf("qc_ref_audio_%d", ai), FieldName: "audio", FieldType: "AUDIO", FieldValue: u,
+			})
+		}
+		if len(extraNodes) > 0 {
+			nodeInfoList = append(nodeInfoList, extraNodes...)
 		}
 	} else if useQCImage {
 		// Official free image families: Nano Banana2 / GPT Image 2.0.
@@ -1061,6 +1230,7 @@ func (s *Server) handleVideoByID(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "worker unavailable"})
 			return
 		}
+		before, _ := s.store.GetTask(realID)
 		if err := s.worker.SyncAndMaybePoll(realID, false); err != nil {
 			// still return latest task row so UI can refresh
 			task, _ := s.store.GetTask(realID)
@@ -1072,7 +1242,8 @@ func (s *Server) handleVideoByID(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "task": task})
+		requeued := before.Status == "running" && strings.TrimSpace(before.RHTaskID) == "" && task.Status == "queued"
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "requeued": requeued, "task": task})
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -1108,6 +1279,16 @@ func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		uid := scopeUserID(a, parseUserIDQuery(r))
 		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		status := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
+		if status != "active" && status != "disabled" {
+			status = ""
+		}
+		dispatch := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("dispatch")))
+		switch dispatch {
+		case "dispatchable", "unavailable", "paused", "cooldown", "busy", "yes", "no", "1", "0":
+		default:
+			dispatch = ""
+		}
 		ownerName := strings.TrimSpace(r.URL.Query().Get("owner"))
 		var ownerUserID int64
 		if a.IsAdmin() && ownerName != "" {
@@ -1116,19 +1297,21 @@ func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 			} else {
 				writeJSON(w, http.StatusOK, map[string]any{
 					"data": []any{}, "total": 0, "page": 1, "page_size": 50, "pages": 0,
+					"quota_stats": store.AccountQuotaStats{},
 				})
 				return
 			}
 		}
 		// No page param → full list (dashboard / legacy). With page → paginate.
 		if strings.TrimSpace(r.URL.Query().Get("page")) == "" && strings.TrimSpace(r.URL.Query().Get("page_size")) == "" {
-			list, err := s.store.ListAccountsPage(uid, ownerUserID, q, 0, 0)
+			list, err := s.store.ListAccountsPage(uid, ownerUserID, q, status, dispatch, 0, 0)
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 				return
 			}
 			s.attachAccountOwners(list)
-			writeJSON(w, http.StatusOK, map[string]any{"data": list, "total": len(list)})
+			quota, _ := s.store.AggregateAccountQuotaStats(uid, ownerUserID, q, status, dispatch)
+			writeJSON(w, http.StatusOK, map[string]any{"data": list, "total": len(list), "quota_stats": quota})
 			return
 		}
 		page := queryIntDefault(r, "page", 1)
@@ -1142,7 +1325,7 @@ func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 		if pageSize > 200 {
 			pageSize = 200
 		}
-		total, err := s.store.CountAccounts(uid, ownerUserID, q)
+		total, err := s.store.CountAccounts(uid, ownerUserID, q, status, dispatch)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
@@ -1156,18 +1339,20 @@ func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 		} else if page > pages {
 			page = pages
 		}
-		list, err := s.store.ListAccountsPage(uid, ownerUserID, q, pageSize, (page-1)*pageSize)
+		list, err := s.store.ListAccountsPage(uid, ownerUserID, q, status, dispatch, pageSize, (page-1)*pageSize)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
 		s.attachAccountOwners(list)
+		quota, _ := s.store.AggregateAccountQuotaStats(uid, ownerUserID, q, status, dispatch)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"data":      list,
-			"total":     total,
-			"page":      page,
-			"page_size": pageSize,
-			"pages":     pages,
+			"data":        list,
+			"total":       total,
+			"page":        page,
+			"page_size":   pageSize,
+			"pages":       pages,
+			"quota_stats": quota,
 		})
 	case http.MethodPost:
 		s.handleCreateAccount(w, r)
@@ -1282,6 +1467,55 @@ func (s *Server) handleAdminAccountByID(w http.ResponseWriter, r *http.Request) 
 			acc.Owner = names[acc.UserID]
 		}
 		writeJSON(w, http.StatusOK, acc)
+	case action == "" && (r.Method == http.MethodPatch || r.Method == http.MethodPut):
+		if !s.requireAccountOwner(w, r, id) {
+			return
+		}
+		var body struct {
+			Email          *string `json:"email"`
+			Password       *string `json:"password"`
+			AccessToken    *string `json:"access_token"`
+			RefreshToken   *string `json:"refresh_token"`
+			APIKey         *string `json:"api_key"`
+			NickName       *string `json:"nick_name"`
+			Status         *string `json:"status"`
+			Source         *string `json:"source"`
+			ExternalID     *string `json:"external_id"`
+			MaxConcurrency *int    `json:"max_concurrency"`
+			EgressID       *int64  `json:"egress_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+			return
+		}
+		acc, err := s.store.UpdateAccountEditable(id, store.AccountEditable{
+			Email:          body.Email,
+			Password:       body.Password,
+			AccessToken:    body.AccessToken,
+			RefreshToken:   body.RefreshToken,
+			APIKey:         body.APIKey,
+			NickName:       body.NickName,
+			Status:         body.Status,
+			Source:         body.Source,
+			ExternalID:     body.ExternalID,
+			MaxConcurrency: body.MaxConcurrency,
+			EgressID:       body.EgressID,
+		})
+		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, store.ErrNotFound) {
+				status = http.StatusNotFound
+			} else if strings.Contains(err.Error(), "占用") {
+				status = http.StatusConflict
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		acc.AdminView()
+		if names, err := s.store.UsernameByID(); err == nil {
+			acc.Owner = names[acc.UserID]
+		}
+		writeJSON(w, http.StatusOK, acc)
 	case action == "" && r.Method == http.MethodDelete:
 		{
 			acc, err := s.store.GetAccount(id)
@@ -1317,6 +1551,27 @@ func (s *Server) handleAdminAccountByID(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		s.refreshAccount(w, id)
+	case action == "edit-nickname" && r.Method == http.MethodPost:
+		if !s.requireAccountOwner(w, r, id) {
+			return
+		}
+		var body struct {
+			NickName string `json:"nick_name"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		acc, result, err := s.editAccountNickName(id, body.NickName)
+		if err != nil {
+			status := http.StatusBadGateway
+			if errors.Is(err, store.ErrNotFound) {
+				status = http.StatusNotFound
+			} else if strings.Contains(err.Error(), "缺少") {
+				status = http.StatusBadRequest
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		acc.AdminView()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result, "account": acc})
 	case action == "ensure-api-key" && r.Method == http.MethodPost:
 		if !s.requireAccountOwner(w, r, id) {
 			return
@@ -1348,7 +1603,15 @@ func (s *Server) handleAdminAccountByID(w http.ResponseWriter, r *http.Request) 
 		if !s.requireAccountOwner(w, r, id) {
 			return
 		}
-		_ = s.store.DisableAccount(id, "manual disable")
+		// Manual disable = pause dispatch only; status stays active for claim/refresh/ops.
+		if err := s.store.PauseAccountDispatch(id); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
 		acc, err := s.store.GetAccount(id)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
@@ -1360,7 +1623,33 @@ func (s *Server) handleAdminAccountByID(w http.ResponseWriter, r *http.Request) 
 		if !s.requireAccountOwner(w, r, id) {
 			return
 		}
-		_ = s.store.EnableAccount(id)
+		if err := s.store.ResumeAccountDispatch(id); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		acc, err := s.store.GetAccount(id)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+			return
+		}
+		acc.PublicView()
+		writeJSON(w, http.StatusOK, acc)
+	case action == "clear-cooldown" && r.Method == http.MethodPost:
+		if !s.requireAccountOwner(w, r, id) {
+			return
+		}
+		if err := s.store.ClearAccountCooldown(id); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
 		acc, err := s.store.GetAccount(id)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
@@ -1519,6 +1808,263 @@ func (s *Server) handleClaimDailyLogin(w http.ResponseWriter, r *http.Request) {
 		"skipped": skipped,
 		"failed":  failed,
 		"gained":  gained,
+		"results": results,
+	})
+}
+
+func (s *Server) handleEditNicknames(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		IDs      []int64 `json:"ids"`
+		NickName string  `json:"nick_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json"})
+		return
+	}
+	if len(body.IDs) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "ids required"})
+		return
+	}
+	actor, _ := actorFromRequest(r)
+	success, failed := 0, 0
+	results := make([]map[string]any, 0, len(body.IDs))
+	for _, id := range body.IDs {
+		item := map[string]any{"id": id}
+		acc, err := s.store.GetAccount(id)
+		if err != nil {
+			failed++
+			item["ok"] = false
+			item["error"] = err.Error()
+			results = append(results, item)
+			continue
+		}
+		item["email"] = acc.Email
+		if !ownsAccount(actor, acc) {
+			failed++
+			item["ok"] = false
+			item["error"] = "无权操作该账号"
+			results = append(results, item)
+			continue
+		}
+		nick := strings.TrimSpace(body.NickName)
+		if nick == "" || len(body.IDs) > 1 {
+			// Batch always uses unique random names unless a single id + explicit nick.
+			if len(body.IDs) == 1 && nick != "" {
+				// keep nick
+			} else {
+				nick = register.RandomNickName()
+			}
+		}
+		_, result, err := s.editAccountNickName(id, nick)
+		if err != nil {
+			failed++
+			item["ok"] = false
+			item["error"] = err.Error()
+			results = append(results, item)
+			continue
+		}
+		success++
+		item["ok"] = true
+		item["result"] = result
+		results = append(results, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": success,
+		"failed":  failed,
+		"results": results,
+	})
+}
+
+func (s *Server) editAccountNickName(id int64, nickName string) (store.Account, map[string]any, error) {
+	acc, err := s.store.GetAccount(id)
+	if err != nil {
+		return store.Account{}, nil, err
+	}
+	nickName = strings.TrimSpace(nickName)
+	if nickName == "" {
+		nickName = register.RandomNickName()
+	}
+	if strings.TrimSpace(acc.Password) == "" && strings.TrimSpace(acc.AccessToken) == "" {
+		return acc, nil, fmt.Errorf("缺少密码与 Access Token，无法登录改昵称")
+	}
+	var gotNick string
+	err = s.egress.Do(acc, s.cfg.BaseURL, func(client *runninghub.Client) error {
+		at := strings.TrimSpace(acc.AccessToken)
+		if at != "" {
+			client.SetAccessToken(at)
+		} else {
+			loginRes, e := client.PwdLogin(acc.Email, acc.Password)
+			if e != nil {
+				return e
+			}
+			token := mapPathString(loginRes, "data", "access_token")
+			if token == "" {
+				token = mapPathString(loginRes, "data", "accessToken")
+			}
+			if token == "" {
+				return fmt.Errorf("login missing access_token")
+			}
+			client.SetAccessToken(token)
+			_ = s.store.UpdateAccountAuthTokens(id, token, firstNonEmpty(
+				mapPathString(loginRes, "data", "refresh_token"),
+				mapPathString(loginRes, "data", "refreshToken"),
+			))
+		}
+		edited, e := client.EditUser(nickName, runninghub.DefaultHeadIcon, "null")
+		if e != nil {
+			// stale AT → one password relogin
+			if strings.TrimSpace(acc.Password) == "" {
+				return e
+			}
+			loginRes, e2 := client.PwdLogin(acc.Email, acc.Password)
+			if e2 != nil {
+				return e
+			}
+			token := mapPathString(loginRes, "data", "access_token")
+			if token == "" {
+				token = mapPathString(loginRes, "data", "accessToken")
+			}
+			if token == "" {
+				return e
+			}
+			client.SetAccessToken(token)
+			_ = s.store.UpdateAccountAuthTokens(id, token, firstNonEmpty(
+				mapPathString(loginRes, "data", "refresh_token"),
+				mapPathString(loginRes, "data", "refreshToken"),
+			))
+			edited, e = client.EditUser(nickName, runninghub.DefaultHeadIcon, "null")
+			if e != nil {
+				return e
+			}
+		}
+		gotNick = firstNonEmpty(mapPathString(edited, "data", "nickName"), nickName)
+		return nil
+	})
+	if err != nil {
+		return acc, nil, err
+	}
+	_ = s.store.UpdateAccountNickName(id, gotNick)
+	acc, _ = s.store.GetAccount(id)
+	return acc, map[string]any{
+		"nick_name": gotNick,
+		"message":   "已修改昵称",
+	}, nil
+}
+
+func mapPathString(m map[string]any, keys ...string) string {
+	var cur any = m
+	for _, k := range keys {
+		mm, ok := cur.(map[string]any)
+		if !ok || mm == nil {
+			return ""
+		}
+		cur = mm[k]
+	}
+	if cur == nil {
+		return ""
+	}
+	if s, ok := cur.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	s := strings.TrimSpace(fmt.Sprint(cur))
+	if s == "<nil>" {
+		return ""
+	}
+	return s
+}
+
+func (s *Server) handleBackfillFingerprints(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		IDs []int64 `json:"ids"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	actor, _ := actorFromRequest(r)
+	scopeUID := actor.UserID
+	if actor.IsAdmin() {
+		scopeUID = 0
+	}
+	ids := body.IDs
+	if len(ids) == 0 {
+		var err error
+		ids, err = s.store.ListAccountIDsMissingFingerprint(scopeUID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+	success, skipped, failed := 0, 0, 0
+	results := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		item := map[string]any{"id": id}
+		acc, err := s.store.GetAccount(id)
+		if err != nil {
+			failed++
+			item["ok"] = false
+			item["error"] = err.Error()
+			results = append(results, item)
+			continue
+		}
+		item["email"] = acc.Email
+		if !ownsAccount(actor, acc) {
+			failed++
+			item["ok"] = false
+			item["error"] = "无权操作该账号"
+			results = append(results, item)
+			continue
+		}
+		if strings.TrimSpace(acc.FingerprintJSON) != "" &&
+			strings.TrimSpace(acc.AnonymousID) != "" &&
+			strings.TrimSpace(acc.DeviceID) != "" {
+			skipped++
+			item["ok"] = true
+			item["skipped"] = true
+			results = append(results, item)
+			continue
+		}
+		anon := strings.TrimSpace(acc.AnonymousID)
+		if anon == "" {
+			anon = register.RandomAnonymousID()
+		}
+		device := strings.TrimSpace(acc.DeviceID)
+		if device == "" {
+			device = register.RandomDeviceID()
+		}
+		fp := strings.TrimSpace(acc.FingerprintJSON)
+		if fp == "" {
+			fp = register.DefaultFingerprintJSON()
+		}
+		filled, err := s.store.FillAccountIdentityEmpty(id, anon, device, fp)
+		if err != nil {
+			failed++
+			item["ok"] = false
+			item["error"] = err.Error()
+			results = append(results, item)
+			continue
+		}
+		if !filled {
+			skipped++
+			item["ok"] = true
+			item["skipped"] = true
+		} else {
+			success++
+			item["ok"] = true
+			item["filled"] = true
+		}
+		results = append(results, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": success,
+		"skipped": skipped,
+		"failed":  failed,
+		"total":   len(ids),
 		"results": results,
 	})
 }
@@ -1795,13 +2341,75 @@ func (s *Server) handleAdminTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	a, _ := actorFromRequest(r)
 	uid := scopeUserID(a, parseUserIDQuery(r))
-	list, err := s.store.ListTasks(uid, 200)
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	status := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
+	switch status {
+	case "queued", "running", "succeeded", "failed", "cancelled":
+	default:
+		status = ""
+	}
+	ownerName := strings.TrimSpace(r.URL.Query().Get("owner"))
+	if a.IsAdmin() && ownerName != "" {
+		if u, err := s.store.GetUserByUsername(ownerName); err == nil {
+			uid = u.ID
+		} else {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"data": []any{}, "total": 0, "page": 1, "page_size": 50, "pages": 0,
+			})
+			return
+		}
+	}
+
+	// Legacy: no page params → capped list for older clients.
+	if strings.TrimSpace(r.URL.Query().Get("page")) == "" && strings.TrimSpace(r.URL.Query().Get("page_size")) == "" {
+		list, err := s.store.ListTasksPage(uid, q, status, 200, 0)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		s.attachTaskOwners(list)
+		writeJSON(w, http.StatusOK, map[string]any{"data": list, "total": len(list)})
+		return
+	}
+
+	page := queryIntDefault(r, "page", 1)
+	pageSize := queryIntDefault(r, "page_size", 50)
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 50
+	}
+	if pageSize > 200 {
+		pageSize = 200
+	}
+	total, err := s.store.CountTasks(uid, q, status)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	pages := 0
+	if total > 0 {
+		pages = (total + pageSize - 1) / pageSize
+	}
+	if pages == 0 {
+		page = 1
+	} else if page > pages {
+		page = pages
+	}
+	list, err := s.store.ListTasksPage(uid, q, status, pageSize, (page-1)*pageSize)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 	s.attachTaskOwners(list)
-	writeJSON(w, http.StatusOK, map[string]any{"data": list})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"data":      list,
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
+		"pages":     pages,
+	})
 }
 
 func (s *Server) attachAccountOwners(list []store.Account) {
@@ -1855,6 +2463,15 @@ func sanitizeName(name string) string {
 		return "image.png"
 	}
 	return name
+}
+
+func sortedMapKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func decodeMaybeBase64(s string) ([]byte, error) {

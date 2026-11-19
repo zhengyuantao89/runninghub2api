@@ -79,10 +79,12 @@ func (c *Cleaner) loop() {
 		case <-c.stopCh:
 			return
 		case <-timer.C:
-			if n, err := c.RunOnce(); err != nil {
-				log.Printf("upload cleaner: %v", err)
-			} else if n > 0 {
-				log.Printf("upload cleaner: removed %d file(s) (keep=%dh)", n, int(c.keepFor().Hours()))
+			files, tasks, jobs, err := c.RunOnce()
+			if err != nil {
+				log.Printf("retention cleaner: %v", err)
+			} else if files > 0 || tasks > 0 || jobs > 0 {
+				log.Printf("retention cleaner: files=%d tasks=%d register_jobs=%d (keep=%dh)",
+					files, tasks, jobs, int(c.keepFor().Hours()))
 			}
 			timer.Reset(c.interval)
 		}
@@ -106,25 +108,25 @@ func (c *Cleaner) underUploads(path string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
 
-// RunOnce deletes expired terminal-task uploads and orphan files. Returns deleted count.
-func (c *Cleaner) RunOnce() (int, error) {
+// RunOnce deletes expired uploads, terminal task rows, and finished register jobs.
+// Returns deleted file / task / register-job counts.
+func (c *Cleaner) RunOnce() (files, tasks, jobs int, err error) {
 	upDir := c.uploadsDir()
-	if err := os.MkdirAll(upDir, 0o755); err != nil {
-		return 0, err
+	if err = os.MkdirAll(upDir, 0o755); err != nil {
+		return 0, 0, 0, err
 	}
 	keep := c.keepFor()
 	cutoff := time.Now().UTC().Add(-keep).Format(time.RFC3339)
 	active, err := c.store.ListActiveUploadPaths()
 	if err != nil {
-		return 0, err
+		return 0, 0, 0, err
 	}
-	deleted := 0
 
-	tasks, err := c.store.ListTerminalUploadsBefore(cutoff)
+	uploadTasks, err := c.store.ListTerminalUploadsBefore(cutoff)
 	if err != nil {
-		return 0, err
+		return 0, 0, 0, err
 	}
-	for _, t := range tasks {
+	for _, t := range uploadTasks {
 		path := strings.TrimSpace(t.ImagePath)
 		if path == "" {
 			continue
@@ -133,20 +135,20 @@ func (c *Cleaner) RunOnce() (int, error) {
 			continue
 		}
 		if c.underUploads(path) {
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-				log.Printf("upload cleaner: remove %s: %v", path, err)
+			if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+				log.Printf("retention cleaner: remove %s: %v", path, rmErr)
 			} else {
-				deleted++
+				files++
 			}
 		}
-		if err := c.store.ClearTaskImagePath(t.ID); err != nil {
-			log.Printf("upload cleaner: clear task %s: %v", t.ID, err)
+		if clearErr := c.store.ClearTaskImagePath(t.ID); clearErr != nil {
+			log.Printf("retention cleaner: clear task %s: %v", t.ID, clearErr)
 		}
 	}
 
 	entries, err := os.ReadDir(upDir)
 	if err != nil {
-		return deleted, err
+		return files, 0, 0, err
 	}
 	activeBase := make(map[string]struct{}, len(active))
 	for p := range active {
@@ -169,11 +171,47 @@ func (c *Cleaner) RunOnce() (int, error) {
 			continue
 		}
 		full := filepath.Join(upDir, name)
-		if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
-			log.Printf("upload cleaner: orphan %s: %v", full, err)
+		if rmErr := os.Remove(full); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("retention cleaner: orphan %s: %v", full, rmErr)
 			continue
 		}
-		deleted++
+		files++
 	}
-	return deleted, nil
+
+	// keep=0 means "clean upload files ASAP" only — never wipe task/register history.
+	// Record purge requires an explicit positive retention window.
+	if keep <= 0 {
+		return files, 0, 0, nil
+	}
+
+	terminal, err := c.store.ListTerminalTasksBefore(cutoff, 500)
+	if err != nil {
+		return files, 0, 0, err
+	}
+	if len(terminal) > 0 {
+		ids := make([]string, 0, len(terminal))
+		for _, t := range terminal {
+			path := strings.TrimSpace(t.ImagePath)
+			if path != "" {
+				if _, keepActive := active[path]; !keepActive && c.underUploads(path) {
+					if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+						log.Printf("retention cleaner: task-file %s: %v", path, rmErr)
+					} else {
+						files++
+					}
+				}
+			}
+			ids = append(ids, t.ID)
+		}
+		tasks, err = c.store.DeleteTasksByIDs(ids)
+		if err != nil {
+			return files, tasks, 0, err
+		}
+	}
+
+	jobs, err = c.store.PurgeFinishedRegisterJobsBefore(cutoff, 200)
+	if err != nil {
+		return files, tasks, jobs, err
+	}
+	return files, tasks, jobs, nil
 }

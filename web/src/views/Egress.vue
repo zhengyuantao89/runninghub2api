@@ -24,8 +24,24 @@ const importText = ref('')
 const importGroup = ref('nodes')
 const busyId = ref(0)
 const subBusy = ref(false)
+const modeBusy = ref(false)
+const registerMode = ref('pool')
+const generateMode = ref('pool')
+const proxiesText = ref('')
 const intervals = ref([10, 30, 60])
 const fixedGroup = ref('nodes')
+
+function normalizeEgressMode(v) {
+  if (v === 'direct') return 'direct'
+  if (v === 'list' || v === 'lines' || v === 'muse' || v === 'proxies') return 'list'
+  return 'pool'
+}
+
+function modeLabel(v) {
+  if (v === 'direct') return '直连'
+  if (v === 'list') return '供应商列表'
+  return '出口池'
+}
 
 const subForm = reactive({
   url: '',
@@ -66,10 +82,11 @@ async function load() {
   error.value = ''
   loading.value = true
   try {
-    const [listRes, groupRes, subRes] = await Promise.all([
+    const [listRes, groupRes, subRes, settingsRes] = await Promise.all([
       api.listProxies(groupFilter.value, page.value, pageSize.value),
       api.listProxyGroups(),
       api.getProxySubscription(),
+      api.getSettings().catch(() => ({})),
     ])
     items.value = Array.isArray(listRes?.items) ? listRes.items : Array.isArray(listRes) ? listRes : []
     total.value = Number(listRes?.total) || 0
@@ -82,10 +99,37 @@ async function load() {
     fixedGroup.value = subRes?.fixed_group || 'nodes'
     const sub = subRes?.subscription || (Array.isArray(subRes?.items) ? subRes.items[0] : null)
     applySubscription(sub)
+    registerMode.value = normalizeEgressMode(settingsRes?.egress?.register_mode)
+    generateMode.value = normalizeEgressMode(settingsRes?.egress?.generate_mode)
+    proxiesText.value = String(settingsRes?.egress?.proxies || '')
   } catch (e) {
     error.value = e.message || String(e)
   } finally {
     loading.value = false
+  }
+}
+
+async function saveEgressModes() {
+  error.value = ''
+  okmsg.value = ''
+  modeBusy.value = true
+  try {
+    const res = await api.updateSettings({
+      egress: {
+        register_mode: normalizeEgressMode(registerMode.value),
+        generate_mode: normalizeEgressMode(generateMode.value),
+        proxies: proxiesText.value,
+      },
+    })
+    registerMode.value = normalizeEgressMode(res?.egress?.register_mode)
+    generateMode.value = normalizeEgressMode(res?.egress?.generate_mode)
+    proxiesText.value = String(res?.egress?.proxies ?? proxiesText.value)
+    const lines = Number(res?.egress?.proxy_lines)
+    okmsg.value = `已保存：注册=${modeLabel(registerMode.value)}，生成=${modeLabel(generateMode.value)}${Number.isFinite(lines) ? `，供应商 ${lines} 行` : ''}`
+  } catch (e) {
+    error.value = e.message || String(e)
+  } finally {
+    modeBusy.value = false
   }
 }
 
@@ -275,6 +319,56 @@ onMounted(load)
 
 <template>
   <div class="space-y-5">
+    <PagePanel>
+      <header class="flex flex-wrap items-start justify-between gap-3">
+        <div class="min-w-0">
+          <h2 class="text-base font-semibold text-foreground">请求出口</h2>
+          <p class="mt-1.5 max-w-2xl text-xs leading-relaxed text-muted-foreground">
+            注册/生成可选：下方出口池、供应商列表（muse 式，支持 {sid}），或直连。不涉及本地存结果。
+          </p>
+        </div>
+        <Button size="sm" variant="primary" :disabled="modeBusy" @click="saveEgressModes">
+          {{ modeBusy ? '保存中…' : '保存' }}
+        </Button>
+      </header>
+      <div class="mt-4 grid gap-3 sm:grid-cols-2">
+        <label class="block space-y-1.5">
+          <span class="text-xs text-muted-foreground">注册出口</span>
+          <select
+            v-model="registerMode"
+            class="h-10 w-full rounded-lg border border-border bg-background px-2 text-sm"
+            :disabled="modeBusy"
+          >
+            <option value="pool">出口池（默认）</option>
+            <option value="list">供应商列表</option>
+            <option value="direct">直连</option>
+          </select>
+        </label>
+        <label class="block space-y-1.5">
+          <span class="text-xs text-muted-foreground">生成出口</span>
+          <select
+            v-model="generateMode"
+            class="h-10 w-full rounded-lg border border-border bg-background px-2 text-sm"
+            :disabled="modeBusy"
+          >
+            <option value="pool">出口池（默认）</option>
+            <option value="list">供应商列表</option>
+            <option value="direct">直连</option>
+          </select>
+        </label>
+      </div>
+      <label class="mt-4 block space-y-1.5">
+        <span class="text-xs text-muted-foreground">供应商代理列表（每行一个；无协议默认 SOCKS5；支持 {sid} 会话占位）</span>
+        <textarea
+          v-model="proxiesText"
+          rows="5"
+          class="w-full rounded-lg border border-border bg-background px-3 py-2 font-mono text-xs leading-relaxed text-foreground"
+          placeholder="us.udealproxy.com:6666:userId-7992-region-us-session-{sid}-sessTime-5:password&#10;socks5h://user:pass@host:3010&#10;host:port:user:pass"
+          :disabled="modeBusy"
+        />
+      </label>
+    </PagePanel>
+
     <PagePanel>
       <header class="flex flex-wrap items-start justify-between gap-3">
         <div class="min-w-0">

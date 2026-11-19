@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -17,6 +18,27 @@ import (
 )
 
 const defaultTimeout = 120 * time.Second
+
+const (
+	ModePool   = "pool"
+	ModeList   = "list"
+	ModeDirect = "direct"
+
+	SettingRegisterMode = "egress.register_mode"
+	SettingGenerateMode = "egress.generate_mode"
+)
+
+// NormalizeMode maps setting values to pool|list|direct (default pool).
+func NormalizeMode(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case ModeDirect:
+		return ModeDirect
+	case ModeList, "lines", "muse", "proxies", "proxy_list":
+		return ModeList
+	default:
+		return ModePool
+	}
+}
 
 // Session is a RH client bound to an optional egress node.
 type Session struct {
@@ -33,9 +55,36 @@ func NewManager(st *store.Store) *Manager {
 	return &Manager{Store: st}
 }
 
+func (m *Manager) RegisterMode() string {
+	if m == nil || m.Store == nil {
+		return ModePool
+	}
+	v, _ := m.Store.GetSetting(SettingRegisterMode)
+	return NormalizeMode(v)
+}
+
+func (m *Manager) GenerateMode() string {
+	if m == nil || m.Store == nil {
+		return ModePool
+	}
+	v, _ := m.Store.GetSetting(SettingGenerateMode)
+	return NormalizeMode(v)
+}
+
 // Resolve returns bound egress or picks a new one and binds it.
-// excludeID is used when rebinding after failure.
+// excludeID is used when rebinding after failure (pool mode only).
+// direct → nil; list → ephemeral muse-style line (not stored in egress pool).
 func (m *Manager) Resolve(acc store.Account, excludeID int64) (*store.EgressNode, error) {
+	switch m.GenerateMode() {
+	case ModeDirect:
+		return nil, nil
+	case ModeList:
+		n, err := m.PickListForUse()
+		if err == store.ErrNotFound {
+			return nil, nil
+		}
+		return n, err
+	}
 	if acc.EgressID > 0 && acc.EgressID != excludeID {
 		n, err := m.Store.GetEgress(acc.EgressID)
 		if err == nil && n.Status == "可用" {
@@ -58,6 +107,22 @@ func (m *Manager) Resolve(acc store.Account, excludeID int64) (*store.EgressNode
 	return &n, nil
 }
 
+// resolveEgressHost rewrites loopback proxy hosts to the Docker host gateway.
+// Inside a container, 127.0.0.1 points at the container itself — not the host Clash/V2Ray.
+func resolveEgressHost(host string) string {
+	h := strings.TrimSpace(strings.ToLower(host))
+	if h != "127.0.0.1" && h != "localhost" && h != "::1" {
+		return strings.TrimSpace(host)
+	}
+	if gw := strings.TrimSpace(os.Getenv("RH2API_HOST_GATEWAY")); gw != "" {
+		return gw
+	}
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return "host.docker.internal"
+	}
+	return strings.TrimSpace(host)
+}
+
 // BuildHTTPClient builds an http.Client that dials via the egress node (or direct).
 func BuildHTTPClient(n *store.EgressNode, timeout time.Duration) (*http.Client, error) {
 	if timeout <= 0 {
@@ -66,6 +131,7 @@ func BuildHTTPClient(n *store.EgressNode, timeout time.Duration) (*http.Client, 
 	if n == nil || strings.TrimSpace(n.Host) == "" {
 		return &http.Client{Timeout: timeout}, nil
 	}
+	host := resolveEgressHost(n.Host)
 	transport := &http.Transport{
 		Proxy:                 nil,
 		MaxIdleConns:          32,
@@ -81,7 +147,7 @@ func BuildHTTPClient(n *store.EgressNode, timeout time.Duration) (*http.Client, 
 		if n.Username != "" || n.Password != "" {
 			auth = &proxy.Auth{User: n.Username, Password: n.Password}
 		}
-		addr := net.JoinHostPort(n.Host, fmt.Sprintf("%d", n.Port))
+		addr := net.JoinHostPort(host, fmt.Sprintf("%d", n.Port))
 		dialer, err := proxy.SOCKS5("tcp", addr, auth, proxy.Direct)
 		if err != nil {
 			return nil, fmt.Errorf("socks5 dialer: %w", err)
@@ -96,7 +162,7 @@ func BuildHTTPClient(n *store.EgressNode, timeout time.Duration) (*http.Client, 
 	default:
 		u := &url.URL{
 			Scheme: "http",
-			Host:   net.JoinHostPort(n.Host, fmt.Sprintf("%d", n.Port)),
+			Host:   net.JoinHostPort(host, fmt.Sprintf("%d", n.Port)),
 		}
 		if ptype == "https" {
 			u.Scheme = "https"
@@ -124,7 +190,16 @@ func (m *Manager) NewClientForAccount(acc store.Account, baseURL string) (*Sessi
 	client.HTTP = httpClient
 	client.ApplyIdentity(acc.AnonymousID, acc.FingerprintJSON)
 	if node == nil {
-		log.Printf("[egress] account=%d email=%s direct (no available egress)", acc.ID, acc.Email)
+		reason := "no available egress"
+		switch m.GenerateMode() {
+		case ModeDirect:
+			reason = "generate mode=direct"
+		case ModeList:
+			reason = "generate mode=list but proxies empty"
+		}
+		log.Printf("[egress] account=%d email=%s direct (%s)", acc.ID, acc.Email, reason)
+	} else if node.ID <= 0 {
+		log.Printf("[egress] account=%d email=%s list=%s %s", acc.ID, acc.Email, node.Label(), node.ProxyType)
 	} else {
 		log.Printf("[egress] account=%d email=%s bind=%s#%d %s", acc.ID, acc.Email, node.Label(), node.ID, node.ProxyType)
 	}
@@ -134,12 +209,14 @@ func (m *Manager) NewClientForAccount(acc store.Account, baseURL string) (*Sessi
 // Rebind clears sticky binding after connectivity failure and returns a new session.
 func (m *Manager) Rebind(acc store.Account, baseURL string, failed *store.EgressNode, reason string) (*Session, error) {
 	exclude := int64(0)
-	if failed != nil {
+	if failed != nil && failed.ID > 0 {
 		exclude = failed.ID
 		_, _ = m.Store.MarkEgressFailure(failed.ID, reason)
 	}
-	_ = m.Store.SetAccountEgress(acc.ID, 0)
-	acc.EgressID = 0
+	if m.GenerateMode() == ModePool {
+		_ = m.Store.SetAccountEgress(acc.ID, 0)
+		acc.EgressID = 0
+	}
 	node, err := m.Resolve(acc, exclude)
 	if err != nil {
 		return nil, err
@@ -156,7 +233,7 @@ func (m *Manager) Rebind(acc store.Account, baseURL string, failed *store.Egress
 
 // MarkOK records egress success after a successful RH call.
 func (m *Manager) MarkOK(sess *Session) {
-	if sess == nil || sess.Node == nil {
+	if sess == nil || sess.Node == nil || sess.Node.ID <= 0 {
 		return
 	}
 	_ = m.Store.MarkEgressSuccess(sess.Node.ID, 0)

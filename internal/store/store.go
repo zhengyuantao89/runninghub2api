@@ -47,10 +47,12 @@ type Account struct {
 	AnonymousID       string `json:"anonymous_id,omitempty"`
 	DeviceID          string `json:"device_id,omitempty"`
 	FingerprintJSON   string `json:"fingerprint_json,omitempty"`
+	NickName          string `json:"nick_name,omitempty"`
 	EgressID          int64  `json:"egress_id,omitempty"`
 	EgressLabel       string `json:"egress_label,omitempty"` // host:port for list/UI
 	MaxConcurrency    int    `json:"max_concurrency"`          // 本网关每号并发上限，默认 1
 	Inflight          int    `json:"inflight"`                 // 本网关已占用槽位数
+	DispatchPaused    bool   `json:"dispatch_paused"`          // 手动暂停调度；status 仍可为 active
 	Status            string `json:"status"`
 	Source            string `json:"source"`
 	ExternalID        string `json:"external_id,omitempty"`
@@ -117,8 +119,20 @@ func Open(dataDir string) (*Store, error) {
 		return nil, err
 	}
 	dbPath := filepath.Join(dataDir, "rh2api.db")
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	// Single writer: MaxOpenConns(1) avoids SQLITE_BUSY under Docker bind mounts on Windows.
+	// busy_timeout gives writers time to wait instead of failing immediately.
+	dsn := dbPath + "?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_txlock=immediate"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
+		return nil, err
+	}
+	// WAL + busy_timeout allow a small pool. MaxOpenConns(1) deadlocks if any
+	// query holds Rows open while calling another DB method (e.g. list+GetEgress).
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(-1)
+	if _, err := db.Exec(`PRAGMA busy_timeout=30000`); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	s := &Store{db: db}
@@ -180,6 +194,14 @@ CREATE TABLE IF NOT EXISTS app_settings (
   value TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS user_settings (
+  user_id INTEGER NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (user_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_user_settings_user ON user_settings(user_id);
 `)
 	if err != nil {
 		return err
@@ -206,11 +228,19 @@ CREATE TABLE IF NOT EXISTS app_settings (
 		{"free_video_remaining", "free_video_remaining INTEGER NOT NULL DEFAULT 0"},
 		{"free_video_total", "free_video_total INTEGER NOT NULL DEFAULT 0"},
 		{"last_free_quota_at", "last_free_quota_at TEXT NOT NULL DEFAULT ''"},
+		{"nick_name", "nick_name TEXT NOT NULL DEFAULT ''"},
+		{"dispatch_paused", "dispatch_paused INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := s.addColumnIfMissing("accounts", col.name, col.ddl); err != nil {
 			return err
 		}
 	}
+	// 旧「手动禁用」迁成：status=active + dispatch_paused=1（NO_COINS 仍保持 disabled）
+	_, _ = s.db.Exec(`
+UPDATE accounts SET dispatch_paused=1, status='active', last_error='', updated_at=?
+WHERE status='disabled'
+  AND (last_error IS NULL OR trim(last_error)='' OR last_error NOT LIKE 'NO_COINS%')
+  AND dispatch_paused=0`, now())
 	s.backfillATExpiresAt()
 	// 旧数据：若仍占用租约但 inflight=0，补 1，避免升级后立刻重复派发
 	_, _ = s.db.Exec(`UPDATE accounts SET inflight=1 WHERE inflight=0 AND lease_task_id!='' AND lease_until!=''`)
@@ -367,6 +397,15 @@ CREATE INDEX IF NOT EXISTS idx_webapp_templates_updated ON webapp_templates(upda
 	}
 	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id, status)`)
 	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_video_tasks_user ON video_tasks(user_id, status, created_at)`)
+	if err := s.migrateMailInboxes(); err != nil {
+		return err
+	}
+	if err := s.migrateRegisterJobs(); err != nil {
+		return err
+	}
+	if err := s.migrateSessions(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -394,12 +433,13 @@ func (s *Store) addColumnIfMissing(table, name, ddl string) error {
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
 
-const accountSelect = `SELECT id,user_id,email,password,access_token,refresh_token,at_expires_at,api_key,identify,rh_user_id,remain_coins,remain_points,free_image_remaining,free_image_total,free_video_remaining,free_video_total,last_free_quota_at,current_task_counts,api_type,billing_version,last_balance_at,last_login_coin_at,anonymous_id,device_id,fingerprint_json,egress_id,max_concurrency,inflight,status,source,external_id,cooldown_until,last_submit_at,fail_count,last_error,lease_task_id,lease_until,created_at,updated_at FROM accounts`
+const accountSelect = `SELECT id,user_id,email,password,access_token,refresh_token,at_expires_at,api_key,identify,rh_user_id,remain_coins,remain_points,free_image_remaining,free_image_total,free_video_remaining,free_video_total,last_free_quota_at,current_task_counts,api_type,billing_version,last_balance_at,last_login_coin_at,anonymous_id,device_id,fingerprint_json,nick_name,egress_id,max_concurrency,inflight,dispatch_paused,status,source,external_id,cooldown_until,last_submit_at,fail_count,last_error,lease_task_id,lease_until,created_at,updated_at FROM accounts`
 
 const taskSelect = `SELECT id,user_id,status,prompt,image_path,webapp_id,template_id,duration,aspect_ratio,resolution,node_info_json,account_id,account_email,rh_task_id,rh_status,queue_index,queue_count,progress_text,file_url,preview_url,error_code,error,attempts,created_at,updated_at,finished_at FROM video_tasks`
 
 func (s *Store) UpsertAccount(a Account) (Account, error) {
-	a.Email = strings.TrimSpace(strings.ToLower(a.Email))
+	// Keep original email casing for display/login; UNIQUE COLLATE NOCASE still de-dupes.
+	a.Email = strings.TrimSpace(a.Email)
 	if a.Email == "" {
 		return Account{}, fmt.Errorf("email required")
 	}
@@ -422,6 +462,7 @@ func (s *Store) UpsertAccount(a Account) (Account, error) {
 INSERT INTO accounts(user_id,email,password,access_token,refresh_token,api_key,identify,rh_user_id,remain_coins,current_task_counts,api_type,last_balance_at,anonymous_id,device_id,fingerprint_json,max_concurrency,status,source,external_id,created_at,updated_at)
 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(email) DO UPDATE SET
+  email=excluded.email,
   user_id=CASE WHEN excluded.user_id=0 THEN accounts.user_id ELSE excluded.user_id END,
   password=CASE WHEN excluded.password='' THEN accounts.password ELSE excluded.password END,
   access_token=CASE WHEN excluded.access_token='' THEN accounts.access_token ELSE excluded.access_token END,
@@ -494,12 +535,39 @@ func (s *Store) FindAccountWithAPIKey() (Account, error) {
 
 // ListAccounts returns accounts. userID=0 means all (admin).
 func (s *Store) ListAccounts(userID int64) ([]Account, error) {
-	return s.ListAccountsPage(userID, 0, "", 0, 0)
+	return s.ListAccountsPage(userID, 0, "", "", "", 0, 0)
 }
 
-func accountListWhere(userID, ownerUserID int64, q string) (string, []any) {
-	where := make([]string, 0, 4)
-	args := make([]any, 0, 6)
+// spendableBalanceSQLExpr is true when RH币 or 积分 is > 0 (mirrors SpendableBalance).
+const spendableBalanceSQLExpr = `(
+  CAST(CASE
+    WHEN trim(IFNULL(remain_coins,''))='' THEN '0'
+    WHEN instr(remain_coins,'.')>0 THEN substr(remain_coins,1,instr(remain_coins,'.')-1)
+    ELSE remain_coins
+  END AS INTEGER) > 0
+  OR
+  CAST(CASE
+    WHEN trim(IFNULL(remain_points,''))='' THEN '0'
+    WHEN instr(remain_points,'.')>0 THEN substr(remain_points,1,instr(remain_points,'.')-1)
+    ELSE remain_points
+  END AS INTEGER) > 0
+)`
+
+// accountDispatchableSQL matches Account.decoratePublic Dispatchable (nowTs = RFC3339 UTC).
+func accountDispatchableSQL(nowTs string) (string, []any) {
+	return `(
+  status='active'
+  AND IFNULL(dispatch_paused,0)=0
+  AND inflight < CASE WHEN IFNULL(max_concurrency,0) < 1 THEN 1 ELSE max_concurrency END
+  AND (cooldown_until='' OR cooldown_until<=?)
+  AND NOT (last_balance_at!='' AND NOT ` + spendableBalanceSQLExpr + `)
+  AND (password!='' OR access_token!='' OR api_key!='')
+)`, []any{nowTs}
+}
+
+func accountListWhere(userID, ownerUserID int64, q, status, dispatch string) (string, []any) {
+	where := make([]string, 0, 6)
+	args := make([]any, 0, 10)
 	if userID > 0 {
 		where = append(where, "user_id=?")
 		args = append(args, userID)
@@ -507,6 +575,30 @@ func accountListWhere(userID, ownerUserID int64, q string) (string, []any) {
 	if ownerUserID > 0 {
 		where = append(where, "user_id=?")
 		args = append(args, ownerUserID)
+	}
+	status = strings.ToLower(strings.TrimSpace(status))
+	if status == "active" || status == "disabled" {
+		where = append(where, "status=?")
+		args = append(args, status)
+	}
+	dispatch = strings.ToLower(strings.TrimSpace(dispatch))
+	nowTs := time.Now().UTC().Format(time.RFC3339)
+	switch dispatch {
+	case "dispatchable", "yes", "1":
+		expr, dArgs := accountDispatchableSQL(nowTs)
+		where = append(where, expr)
+		args = append(args, dArgs...)
+	case "unavailable", "no", "0":
+		expr, dArgs := accountDispatchableSQL(nowTs)
+		where = append(where, "NOT "+expr)
+		args = append(args, dArgs...)
+	case "paused":
+		where = append(where, "IFNULL(dispatch_paused,0)!=0")
+	case "cooldown":
+		where = append(where, "cooldown_until!='' AND cooldown_until>?")
+		args = append(args, nowTs)
+	case "busy":
+		where = append(where, "inflight>0")
 	}
 	q = strings.TrimSpace(q)
 	if q != "" {
@@ -520,17 +612,58 @@ func accountListWhere(userID, ownerUserID int64, q string) (string, []any) {
 	return " WHERE " + strings.Join(where, " AND "), args
 }
 
-func (s *Store) CountAccounts(userID, ownerUserID int64, q string) (int, error) {
-	clause, args := accountListWhere(userID, ownerUserID, q)
+func (s *Store) CountAccounts(userID, ownerUserID int64, q, status, dispatch string) (int, error) {
+	clause, args := accountListWhere(userID, ownerUserID, q, status, dispatch)
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM accounts`+clause, args...).Scan(&n)
 	return n, err
 }
 
+// AccountQuotaStats is aggregate wallet/free-quota across a filtered account set.
+type AccountQuotaStats struct {
+	ImageRemaining int     `json:"image_remaining"`
+	ImageTotal     int     `json:"image_total"`
+	VideoRemaining int     `json:"video_remaining"`
+	VideoTotal     int     `json:"video_total"`
+	Points         float64 `json:"points"`
+	Coins          float64 `json:"coins"`
+	WithImage      int     `json:"with_image"`  // accounts with image remaining > 0
+	WithVideo      int     `json:"with_video"`
+	WithPoints     int     `json:"with_points"` // remain_points > 0
+	Accounts       int     `json:"accounts"`
+}
+
+func (s *Store) AggregateAccountQuotaStats(userID, ownerUserID int64, q, status, dispatch string) (AccountQuotaStats, error) {
+	clause, args := accountListWhere(userID, ownerUserID, q, status, dispatch)
+	var st AccountQuotaStats
+	err := s.db.QueryRow(`
+SELECT
+  COUNT(*),
+  COALESCE(SUM(free_image_remaining),0),
+  COALESCE(SUM(free_image_total),0),
+  COALESCE(SUM(free_video_remaining),0),
+  COALESCE(SUM(free_video_total),0),
+  COALESCE(SUM(CASE WHEN CAST(IFNULL(NULLIF(trim(remain_points),''),'0') AS REAL) > 0 THEN CAST(remain_points AS REAL) ELSE 0 END),0),
+  COALESCE(SUM(CASE WHEN CAST(IFNULL(NULLIF(trim(remain_coins),''),'0') AS REAL) > 0 THEN CAST(remain_coins AS REAL) ELSE 0 END),0),
+  COALESCE(SUM(CASE WHEN free_image_remaining > 0 THEN 1 ELSE 0 END),0),
+  COALESCE(SUM(CASE WHEN free_video_remaining > 0 THEN 1 ELSE 0 END),0),
+  COALESCE(SUM(CASE WHEN CAST(IFNULL(NULLIF(trim(remain_points),''),'0') AS REAL) > 0 THEN 1 ELSE 0 END),0)
+FROM accounts`+clause, args...).Scan(
+		&st.Accounts,
+		&st.ImageRemaining, &st.ImageTotal,
+		&st.VideoRemaining, &st.VideoTotal,
+		&st.Points, &st.Coins,
+		&st.WithImage, &st.WithVideo, &st.WithPoints,
+	)
+	return st, err
+}
+
 // ListAccountsPage returns accounts ordered by id DESC.
 // limit<=0 means no LIMIT (full list).
-func (s *Store) ListAccountsPage(userID, ownerUserID int64, q string, limit, offset int) ([]Account, error) {
-	clause, args := accountListWhere(userID, ownerUserID, q)
+// status filters exact active/disabled when set; empty means all.
+// dispatch filters dispatchable|unavailable|paused|cooldown|busy when set.
+func (s *Store) ListAccountsPage(userID, ownerUserID int64, q, status, dispatch string, limit, offset int) ([]Account, error) {
+	clause, args := accountListWhere(userID, ownerUserID, q, status, dispatch)
 	sqlText := accountSelect + clause + ` ORDER BY id DESC`
 	if limit > 0 {
 		if offset < 0 {
@@ -543,12 +676,12 @@ func (s *Store) ListAccountsPage(userID, ownerUserID int64, q string, limit, off
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	nowTs := time.Now().UTC()
 	out := make([]Account, 0)
 	for rows.Next() {
 		a, err := s.scanAccountRows(rows)
 		if err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
 		a.decoratePublic(nowTs)
@@ -559,14 +692,38 @@ func (s *Store) ListAccountsPage(userID, ownerUserID int64, q string, limit, off
 		a.FingerprintJSON = "" // list 只回 has_fingerprint，完整指纹仅 GetAccount / 调度内用
 		a.LeaseTaskID = ""
 		a.LeaseUntil = ""
-		if a.EgressID > 0 {
-			if n, err := s.GetEgress(a.EgressID); err == nil {
-				a.EgressLabel = n.Label()
-			}
-		}
 		out = append(out, a)
 	}
-	return out, rows.Err()
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	// Fill labels after Rows are closed — nested GetEgress while Rows hold the
+	// only pool conn deadlocks under low MaxOpenConns.
+	s.fillAccountEgressLabels(out)
+	return out, nil
+}
+
+func (s *Store) fillAccountEgressLabels(list []Account) {
+	cache := make(map[int64]string)
+	for i := range list {
+		id := list[i].EgressID
+		if id <= 0 {
+			continue
+		}
+		if label, ok := cache[id]; ok {
+			list[i].EgressLabel = label
+			continue
+		}
+		n, err := s.GetEgress(id)
+		if err != nil {
+			continue
+		}
+		label := n.Label()
+		cache[id] = label
+		list[i].EgressLabel = label
+	}
 }
 
 func (s *Store) reclaimExpiredLeases(nowTs time.Time) {
@@ -584,9 +741,9 @@ func (s *Store) ListDispatchableAccounts(userID int64, submitGap time.Duration) 
 		err  error
 	)
 	if userID > 0 {
-		rows, err = s.db.Query(accountSelect+` WHERE status='active' AND user_id=? ORDER BY updated_at ASC, id ASC`, userID)
+		rows, err = s.db.Query(accountSelect+` WHERE status='active' AND dispatch_paused=0 AND user_id=? ORDER BY updated_at ASC, id ASC`, userID)
 	} else {
-		rows, err = s.db.Query(accountSelect + ` WHERE status='active' ORDER BY updated_at ASC, id ASC`)
+		rows, err = s.db.Query(accountSelect + ` WHERE status='active' AND dispatch_paused=0 ORDER BY updated_at ASC, id ASC`)
 	}
 	if err != nil {
 		return nil, err
@@ -597,6 +754,9 @@ func (s *Store) ListDispatchableAccounts(userID int64, submitGap time.Duration) 
 		a, err := s.scanAccountRows(rows)
 		if err != nil {
 			return nil, err
+		}
+		if a.DispatchPaused {
+			continue
 		}
 		if a.Password == "" && a.AccessToken == "" {
 			continue
@@ -649,7 +809,7 @@ func (a *Account) decoratePublic(nowTs time.Time) {
 		cooling = true
 	}
 	noCoins := a.LastBalanceAt != "" && a.SpendableBalance() <= 0
-	a.Dispatchable = a.Status == "active" && !slotsFull && !cooling && !noCoins && (a.Password != "" || a.AccessToken != "" || a.HasAPIKey)
+	a.Dispatchable = a.Status == "active" && !a.DispatchPaused && !slotsFull && !cooling && !noCoins && (a.Password != "" || a.AccessToken != "" || a.HasAPIKey)
 }
 
 // SpendableBalance is any usable balance for scheduling.
@@ -771,6 +931,48 @@ WHERE id=?`, truncate(reason, 500), now(), id)
 func (s *Store) EnableAccount(id int64) error {
 	_, err := s.db.Exec(`UPDATE accounts SET status='active', last_error='', updated_at=? WHERE id=?`, now(), id)
 	return err
+}
+
+// PauseAccountDispatch manually pauses task dispatch; status stays active for ops (claim/refresh/…).
+func (s *Store) PauseAccountDispatch(id int64) error {
+	res, err := s.db.Exec(`UPDATE accounts SET dispatch_paused=1, updated_at=? WHERE id=?`, now(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ResumeAccountDispatch clears dispatch pause, cooldown, and reactivates disabled rows
+// (including NO_COINS) when the user explicitly recovers the account.
+func (s *Store) ResumeAccountDispatch(id int64) error {
+	acc, err := s.GetAccount(id)
+	if err != nil {
+		return err
+	}
+	ts := now()
+	if acc.Status == "disabled" {
+		_, err = s.db.Exec(`UPDATE accounts SET dispatch_paused=0, status='active', last_error='', cooldown_until='', updated_at=? WHERE id=?`, ts, id)
+	} else {
+		_, err = s.db.Exec(`UPDATE accounts SET dispatch_paused=0, cooldown_until='', updated_at=? WHERE id=?`, ts, id)
+	}
+	return err
+}
+
+// ClearAccountCooldown clears cooldown_until so the account can be dispatched again.
+func (s *Store) ClearAccountCooldown(id int64) error {
+	res, err := s.db.Exec(`UPDATE accounts SET cooldown_until='', updated_at=? WHERE id=?`, now(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) DeleteAccount(id int64) error {
@@ -925,6 +1127,192 @@ func (s *Store) UpdateAccountRHUserID(id int64, userID string) error {
 	return err
 }
 
+func (s *Store) UpdateAccountNickName(id int64, nickName string) error {
+	nickName = strings.TrimSpace(nickName)
+	_, err := s.db.Exec(`UPDATE accounts SET nick_name=?, updated_at=? WHERE id=?`, nickName, now(), id)
+	return err
+}
+
+// AccountEditable is a partial update for admin account detail edits.
+// Pointer / special empty-means-clear fields: omit unchanged; empty string clears password/tokens/key when ClearSecrets set via explicit flags.
+type AccountEditable struct {
+	Email          *string
+	Password       *string
+	AccessToken    *string
+	RefreshToken   *string
+	APIKey         *string
+	NickName       *string
+	Status         *string
+	Source         *string
+	ExternalID     *string
+	MaxConcurrency *int
+	EgressID       *int64
+}
+
+// UpdateAccountEditable patches local account fields. Email uniqueness is case-insensitive.
+func (s *Store) UpdateAccountEditable(id int64, in AccountEditable) (Account, error) {
+	cur, err := s.GetAccount(id)
+	if err != nil {
+		return Account{}, err
+	}
+	email := cur.Email
+	if in.Email != nil {
+		email = strings.TrimSpace(*in.Email)
+		if email == "" {
+			return Account{}, fmt.Errorf("email required")
+		}
+		if !strings.EqualFold(email, cur.Email) {
+			other, oerr := s.GetAccountByEmail(email)
+			if oerr == nil && other.ID != id {
+				return Account{}, fmt.Errorf("邮箱已被其他账号占用")
+			}
+			if oerr != nil && !errors.Is(oerr, ErrNotFound) {
+				return Account{}, oerr
+			}
+		}
+	}
+	password := cur.Password
+	if in.Password != nil {
+		password = strings.TrimSpace(*in.Password)
+	}
+	accessToken := cur.AccessToken
+	if in.AccessToken != nil {
+		accessToken = strings.TrimSpace(*in.AccessToken)
+	}
+	refreshToken := cur.RefreshToken
+	if in.RefreshToken != nil {
+		refreshToken = strings.TrimSpace(*in.RefreshToken)
+	}
+	apiKey := cur.APIKey
+	if in.APIKey != nil {
+		apiKey = strings.TrimSpace(*in.APIKey)
+	}
+	nickName := cur.NickName
+	if in.NickName != nil {
+		nickName = strings.TrimSpace(*in.NickName)
+	}
+	status := cur.Status
+	if in.Status != nil {
+		st := strings.ToLower(strings.TrimSpace(*in.Status))
+		if st != "active" && st != "disabled" {
+			return Account{}, fmt.Errorf("status 仅支持 active/disabled")
+		}
+		status = st
+	}
+	source := cur.Source
+	if in.Source != nil {
+		source = strings.TrimSpace(*in.Source)
+	}
+	externalID := cur.ExternalID
+	if in.ExternalID != nil {
+		externalID = strings.TrimSpace(*in.ExternalID)
+	}
+	maxConc := cur.MaxConcurrency
+	if maxConc < 1 {
+		maxConc = 1
+	}
+	if in.MaxConcurrency != nil {
+		maxConc = *in.MaxConcurrency
+		if maxConc < 1 || maxConc > 64 {
+			return Account{}, fmt.Errorf("max_concurrency 需在 1..64")
+		}
+	}
+	egressID := cur.EgressID
+	if in.EgressID != nil {
+		egressID = *in.EgressID
+		if egressID < 0 {
+			egressID = 0
+		}
+	}
+	atExp := cur.ATExpiresAt
+	if in.AccessToken != nil {
+		if accessToken == "" {
+			atExp = ""
+		} else if exp := jwtExpiresAtRFC3339(accessToken); exp != "" {
+			atExp = exp
+		}
+	}
+	ts := now()
+	res, err := s.db.Exec(`
+UPDATE accounts SET
+  email=?, password=?, access_token=?, refresh_token=?, at_expires_at=?,
+  api_key=?, nick_name=?, status=?, source=?, external_id=?,
+  max_concurrency=?, egress_id=?, updated_at=?
+WHERE id=?`,
+		email, password, accessToken, refreshToken, atExp,
+		apiKey, nickName, status, source, externalID,
+		maxConc, egressID, ts, id,
+	)
+	if err != nil {
+		return Account{}, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return Account{}, ErrNotFound
+	}
+	return s.GetAccount(id)
+}
+
+// FillAccountIdentityEmpty writes anonymous_id / device_id / fingerprint_json
+// only where the corresponding column is currently empty.
+func (s *Store) FillAccountIdentityEmpty(id int64, anonymousID, deviceID, fingerprintJSON string) (filled bool, err error) {
+	anonymousID = strings.TrimSpace(anonymousID)
+	deviceID = strings.TrimSpace(deviceID)
+	fingerprintJSON = strings.TrimSpace(fingerprintJSON)
+	if anonymousID == "" && deviceID == "" && fingerprintJSON == "" {
+		return false, nil
+	}
+	res, err := s.db.Exec(`
+UPDATE accounts SET
+  anonymous_id=CASE WHEN trim(ifnull(anonymous_id,''))='' AND ?!='' THEN ? ELSE anonymous_id END,
+  device_id=CASE WHEN trim(ifnull(device_id,''))='' AND ?!='' THEN ? ELSE device_id END,
+  fingerprint_json=CASE WHEN trim(ifnull(fingerprint_json,''))='' AND ?!='' THEN ? ELSE fingerprint_json END,
+  updated_at=?
+WHERE id=?
+  AND (
+    (trim(ifnull(anonymous_id,''))='' AND ?!='')
+    OR (trim(ifnull(device_id,''))='' AND ?!='')
+    OR (trim(ifnull(fingerprint_json,''))='' AND ?!='')
+  )`,
+		anonymousID, anonymousID,
+		deviceID, deviceID,
+		fingerprintJSON, fingerprintJSON,
+		now(), id,
+		anonymousID, deviceID, fingerprintJSON,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// ListAccountIDsMissingFingerprint returns account ids with empty fingerprint_json.
+// userID>0 scopes to that owner; userID==0 = all.
+func (s *Store) ListAccountIDsMissingFingerprint(userID int64) ([]int64, error) {
+	q := `SELECT id FROM accounts WHERE trim(ifnull(fingerprint_json,''))=''`
+	args := []any{}
+	if userID > 0 {
+		q += ` AND user_id=?`
+		args = append(args, userID)
+	}
+	q += ` ORDER BY id ASC`
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) CreateTask(t VideoTask) error {
 	_, err := s.db.Exec(`INSERT INTO video_tasks(id,user_id,status,prompt,image_path,webapp_id,template_id,duration,aspect_ratio,resolution,node_info_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		t.ID, t.UserID, t.Status, t.Prompt, t.ImagePath, t.WebappID, t.TemplateID, t.Duration, t.AspectRatio, t.Resolution, t.NodeInfoJSON, t.CreatedAt, t.UpdatedAt)
@@ -953,20 +1341,74 @@ func (s *Store) ListRunningWithRHTask() ([]VideoTask, error) {
 	return out, rows.Err()
 }
 
+// ListRunningWithoutRHTask returns running tasks stuck before RH submit returned an id
+// (e.g. process restarted mid-submit). These need requeue, not poll resume.
+func (s *Store) ListRunningWithoutRHTask() ([]VideoTask, error) {
+	rows, err := s.db.Query(taskSelect + ` WHERE status='running' AND (rh_task_id='' OR rh_task_id IS NULL) ORDER BY updated_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]VideoTask, 0)
+	for rows.Next() {
+		t, err := s.scanTaskRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // ListTasks returns tasks. userID=0 means all (admin).
 func (s *Store) ListTasks(userID int64, limit int) ([]VideoTask, error) {
+	return s.ListTasksPage(userID, "", "", limit, 0)
+}
+
+func taskListWhere(userID int64, q, status string) (string, []any) {
+	where := make([]string, 0, 3)
+	args := make([]any, 0, 5)
+	if userID > 0 {
+		where = append(where, "user_id=?")
+		args = append(args, userID)
+	}
+	q = strings.TrimSpace(q)
+	if q != "" {
+		like := "%" + q + "%"
+		where = append(where, `(id LIKE ? OR rh_task_id LIKE ?)`)
+		args = append(args, like, like)
+	}
+	status = strings.ToLower(strings.TrimSpace(status))
+	switch status {
+	case "queued", "running", "succeeded", "failed", "cancelled":
+		where = append(where, "status=?")
+		args = append(args, status)
+	}
+	if len(where) == 0 {
+		return "", nil
+	}
+	return " WHERE " + strings.Join(where, " AND "), args
+}
+
+func (s *Store) CountTasks(userID int64, q, status string) (int, error) {
+	clause, args := taskListWhere(userID, q, status)
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM video_tasks`+clause, args...).Scan(&n)
+	return n, err
+}
+
+// ListTasksPage returns tasks ordered by created_at DESC. limit<=0 defaults to 50.
+// q matches local task id or rh_task_id (substring). status filters exact status when set.
+func (s *Store) ListTasksPage(userID int64, q, status string, limit, offset int) ([]VideoTask, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	var (
-		rows *sql.Rows
-		err  error
-	)
-	if userID > 0 {
-		rows, err = s.db.Query(taskSelect+` WHERE user_id=? ORDER BY created_at DESC LIMIT ?`, userID, limit)
-	} else {
-		rows, err = s.db.Query(taskSelect+` ORDER BY created_at DESC LIMIT ?`, limit)
+	if offset < 0 {
+		offset = 0
 	}
+	clause, args := taskListWhere(userID, q, status)
+	args = append(args, limit, offset)
+	rows, err := s.db.Query(taskSelect+clause+` ORDER BY created_at DESC LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1004,7 +1446,8 @@ func (s *Store) ClaimQueuedTask() (VideoTask, error) {
 }
 
 func (s *Store) UpdateTaskRunning(id string, accountID int64, email, rhTaskID string) error {
-	_, err := s.db.Exec(`UPDATE video_tasks SET status='running', account_id=?, account_email=?, rh_task_id=?, updated_at=? WHERE id=?`,
+	// Clear prior soft errors (e.g. BUSY/423) once RH accepted the create.
+	_, err := s.db.Exec(`UPDATE video_tasks SET status='running', account_id=?, account_email=?, rh_task_id=?, error='', error_code='', updated_at=? WHERE id=?`,
 		accountID, email, rhTaskID, now(), id)
 	return err
 }
@@ -1102,21 +1545,67 @@ func (s *Store) ClearTaskImagePath(id string) error {
 	return err
 }
 
+// ListTerminalTasksBefore returns finished tasks older than cutoff (for retention purge).
+func (s *Store) ListTerminalTasksBefore(cutoffRFC3339 string, limit int) ([]VideoTask, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.db.Query(
+		taskSelect+` WHERE status IN ('succeeded','failed','cancelled') AND (
+			(finished_at!='' AND finished_at < ?) OR (finished_at='' AND updated_at < ?)
+		) ORDER BY updated_at ASC LIMIT ?`,
+		cutoffRFC3339, cutoffRFC3339, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]VideoTask, 0)
+	for rows.Next() {
+		t, err := s.scanTaskRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// DeleteTasksByIDs removes video_tasks by id. Returns deleted count.
+func (s *Store) DeleteTasksByIDs(ids []string) (int, error) {
+	deleted := 0
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		res, err := s.db.Exec(`DELETE FROM video_tasks WHERE id=?`, id)
+		if err != nil {
+			return deleted, err
+		}
+		n, _ := res.RowsAffected()
+		deleted += int(n)
+	}
+	return deleted, nil
+}
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }
 
 func (s *Store) scanAccount(row rowScanner) (Account, error) {
 	var a Account
+	var paused int
 	err := row.Scan(
 		&a.ID, &a.UserID, &a.Email, &a.Password, &a.AccessToken, &a.RefreshToken, &a.ATExpiresAt, &a.APIKey, &a.Identify, &a.RHUserID,
 		&a.RemainCoins, &a.RemainPoints,
 		&a.FreeImageRemaining, &a.FreeImageTotal, &a.FreeVideoRemaining, &a.FreeVideoTotal, &a.LastFreeQuotaAt,
 		&a.CurrentTaskCounts, &a.APIType, &a.BillingVersion, &a.LastBalanceAt, &a.LastLoginCoinAt,
-		&a.AnonymousID, &a.DeviceID, &a.FingerprintJSON, &a.EgressID, &a.MaxConcurrency, &a.Inflight,
-		&a.Status, &a.Source, &a.ExternalID, &a.CooldownUntil, &a.LastSubmitAt, &a.FailCount, &a.LastError,
+		&a.AnonymousID, &a.DeviceID, &a.FingerprintJSON, &a.NickName, &a.EgressID, &a.MaxConcurrency, &a.Inflight,
+		&paused, &a.Status, &a.Source, &a.ExternalID, &a.CooldownUntil, &a.LastSubmitAt, &a.FailCount, &a.LastError,
 		&a.LeaseTaskID, &a.LeaseUntil, &a.CreatedAt, &a.UpdatedAt,
 	)
+	a.DispatchPaused = paused != 0
 	if err == nil && a.MaxConcurrency < 1 {
 		a.MaxConcurrency = 1
 	}
@@ -1186,6 +1675,53 @@ func (s *Store) SetSetting(key, value string) error {
 		key, value, now(),
 	)
 	return err
+}
+
+// GetUserSetting returns a per-user setting; empty string if missing.
+func (s *Store) GetUserSetting(userID int64, key string) (string, error) {
+	if userID <= 0 {
+		return "", nil
+	}
+	var value string
+	err := s.db.QueryRow(
+		`SELECT value FROM user_settings WHERE user_id=? AND key=?`,
+		userID, strings.TrimSpace(key),
+	).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return value, err
+}
+
+// SetUserSetting upserts a per-user setting.
+func (s *Store) SetUserSetting(userID int64, key, value string) error {
+	if userID <= 0 {
+		return fmt.Errorf("user id required")
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return fmt.Errorf("setting key required")
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO user_settings(user_id,key,value,updated_at) VALUES(?,?,?,?)
+		 ON CONFLICT(user_id,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+		userID, key, value, now(),
+	)
+	return err
+}
+
+// GetSettingPreferUser returns user value when non-empty, otherwise global app_settings.
+func (s *Store) GetSettingPreferUser(userID int64, key string) (string, error) {
+	if userID > 0 {
+		v, err := s.GetUserSetting(userID, key)
+		if err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(v) != "" {
+			return v, nil
+		}
+	}
+	return s.GetSetting(key)
 }
 
 // NormalizeUploadKeepHours clamps to [0, 720] (0 = clean ASAP after finish).

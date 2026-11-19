@@ -78,7 +78,7 @@ export function logClaimResponse(res, { emailHint = '' } = {}) {
   if (!results.length) {
     runLog.warning(
       emailHint
-        ? `${emailHint} 这边没找到可领的号，可能状态不对`
+        ? `${emailHint} 这边没找到可领的号（请确认账号还在库里，且有密码或 AT）`
         : '这批一个都没动到，可能没有可领的号',
     )
     return

@@ -112,6 +112,13 @@ func (s *Server) redirectLogin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) withActor(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		nav := isBrowserNavigation(r)
+		// Browser hard-refresh of console routes (e.g. /admin/mail-inboxes) has no
+		// Authorization header — localStorage is only available to SPA JS. Always
+		// serve index.html and let the Vue router/API client authenticate.
+		if nav && isConsolePagePath(r.URL.Path) {
+			s.serveSPAIndex(w, r)
+			return
+		}
 		a, ok := s.resolveActor(r)
 		if !ok {
 			if nav {
@@ -119,11 +126,6 @@ func (s *Server) withActor(next http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "未登录或登录已失效"})
-			return
-		}
-		if nav && isConsolePagePath(r.URL.Path) {
-			// Same path as Vue console pages (e.g. /admin/accounts): serve SPA, not JSON API.
-			s.serveSPAIndex(w, r)
 			return
 		}
 		next(w, r.WithContext(withActor(r.Context(), a)))

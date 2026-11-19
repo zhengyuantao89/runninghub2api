@@ -36,8 +36,20 @@ func (w *Worker) Start(n int) {
 }
 
 // resumeOrphanRunning re-attaches pollers for running tasks that already have rh_task_id
-// (e.g. process restarted mid-poll).
+// (e.g. process restarted mid-poll). Running rows without rh_task_id are requeued.
 func (w *Worker) resumeOrphanRunning() {
+	if stuck, err := w.store.ListRunningWithoutRHTask(); err != nil {
+		log.Printf("[worker] list stuck running(no rh id): %v", err)
+	} else {
+		for _, task := range stuck {
+			if _, err := w.RecoverStuckNoRHTask(task.ID); err != nil {
+				log.Printf("[task %s] requeue after restart (no rh id): %v", task.ID, err)
+			} else {
+				log.Printf("[task %s] requeued after restart (no rh_task_id)", task.ID)
+			}
+		}
+	}
+
 	list, err := w.store.ListRunningWithRHTask()
 	if err != nil {
 		log.Printf("[worker] list orphan running: %v", err)
@@ -55,6 +67,31 @@ func (w *Worker) resumeOrphanRunning() {
 	}
 }
 
+// RecoverStuckNoRHTask releases the account lease and requeues a running task that never got rh_task_id.
+func (w *Worker) RecoverStuckNoRHTask(taskID string) (requeued bool, err error) {
+	task, err := w.store.GetTask(taskID)
+	if err != nil {
+		return false, err
+	}
+	if task.Status != "running" && task.Status != "queued" {
+		return false, fmt.Errorf("task status is %s, nothing to recover", task.Status)
+	}
+	if strings.TrimSpace(task.RHTaskID) != "" {
+		return false, nil
+	}
+	if task.Status == "queued" {
+		// Normal pre-submit queue — nothing to recover.
+		return false, nil
+	}
+	if task.AccountID > 0 {
+		_ = w.pool.ReleaseOK(task.AccountID)
+	}
+	if err := w.store.RequeueTask(task.ID, "NO_RH_ID", "stuck running without rh_task_id; requeued"); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ResolvePollAuth returns runtime setting, falling back to env default.
 func (w *Worker) ResolvePollAuth() string {
 	if v, err := w.store.GetSetting(store.SettingPollAuth); err == nil && strings.TrimSpace(v) != "" {
@@ -64,6 +101,7 @@ func (w *Worker) ResolvePollAuth() string {
 }
 
 // SyncAndMaybePoll queries RH once; if still in progress and continuePoll, keeps polling until done.
+// Running tasks without rh_task_id are requeued for resubmit.
 func (w *Worker) SyncAndMaybePoll(taskID string, continuePoll bool) error {
 	task, err := w.store.GetTask(taskID)
 	if err != nil {
@@ -73,7 +111,11 @@ func (w *Worker) SyncAndMaybePoll(taskID string, continuePoll bool) error {
 		return fmt.Errorf("task status is %s, nothing to sync", task.Status)
 	}
 	if strings.TrimSpace(task.RHTaskID) == "" {
-		return fmt.Errorf("no rh_task_id yet; wait for submit or requeue")
+		if task.Status == "running" {
+			_, err := w.RecoverStuckNoRHTask(taskID)
+			return err
+		}
+		return fmt.Errorf("尚未提交到 RH（无 rh_task_id），请稍候")
 	}
 	acc, err := w.store.GetAccount(task.AccountID)
 	if err != nil {
@@ -163,7 +205,7 @@ func (w *Worker) syncAndMaybePollQC(task store.VideoTask, acc store.Account, con
 	if runErr != nil {
 		low := strings.ToLower(runErr.Error())
 		if strings.Contains(low, "timeout") {
-			_ = w.store.UpdateTaskProgress(task.ID, first(snap.RHStatus, "RUNNING"), "轮询超时，可点「查询状态」", snap.QueueIndex, snap.QueueCount)
+			_ = w.store.UpdateTaskProgress(task.ID, first(snap.RHStatus, "RUNNING"), "轮询超时，可点「查询」", snap.QueueIndex, snap.QueueCount)
 			return runErr
 		}
 		if strings.Contains(low, "fail") || strings.Contains(low, "error") || strings.Contains(low, "cancel") {
@@ -269,7 +311,7 @@ func (w *Worker) syncAndMaybePollAPIKey(task store.VideoTask, acc store.Account,
 	if err != nil {
 		low := strings.ToLower(err.Error())
 		if strings.Contains(low, "timeout") {
-			_ = w.store.UpdateTaskProgress(task.ID, first(snap.RHStatus, "RUNNING"), "轮询超时，可点「查询状态」", snap.QueueIndex, snap.QueueCount)
+			_ = w.store.UpdateTaskProgress(task.ID, first(snap.RHStatus, "RUNNING"), "轮询超时，可点「查询」", snap.QueueIndex, snap.QueueCount)
 			return err
 		}
 		if strings.Contains(low, "fail") || strings.Contains(low, "error") || strings.Contains(low, "cancel") {
@@ -345,7 +387,7 @@ func (w *Worker) syncAndMaybePollAT(task store.VideoTask, acc store.Account, con
 	if runErr != nil {
 		low := strings.ToLower(runErr.Error())
 		if strings.Contains(low, "timeout") {
-			_ = w.store.UpdateTaskProgress(task.ID, first(snap.RHStatus, "RUNNING"), "轮询超时，可点「查询状态」", snap.QueueIndex, snap.QueueCount)
+			_ = w.store.UpdateTaskProgress(task.ID, first(snap.RHStatus, "RUNNING"), "轮询超时，可点「查询」", snap.QueueIndex, snap.QueueCount)
 			return runErr
 		}
 		if strings.Contains(low, "fail") || strings.Contains(low, "error") || strings.Contains(low, "cancel") {

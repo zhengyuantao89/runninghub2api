@@ -569,7 +569,7 @@ func (s *Server) buildFreeVideoCreateRequest(r *http.Request) (*http.Request, st
 	modelID := ModelMinimaxH3RHEnhanced
 
 	if strings.HasPrefix(ct, "multipart/form-data") {
-		if err := r.ParseMultipartForm(64 << 20); err != nil {
+		if err := r.ParseMultipartForm(512 << 20); err != nil {
 			return nil, "", err
 		}
 		prompt := strings.TrimSpace(r.FormValue("prompt"))
@@ -592,12 +592,15 @@ func (s *Server) buildFreeVideoCreateRequest(r *http.Request) (*http.Request, st
 		fields["aspect_ratio"] = firstNonEmpty(r.FormValue("aspect_ratio"), r.FormValue("size"), "3:2 (Photo)")
 		fields["resolution"] = firstNonEmpty(r.FormValue("resolution"), "480p")
 		if r.MultipartForm != nil {
-			idx := 0
+			imgIdx, vidIdx, audIdx := 0, 0, 0
 			for key, fhs := range r.MultipartForm.File {
 				if len(fhs) == 0 {
 					continue
 				}
-				if key != "image" && key != "input_reference" && !strings.HasPrefix(key, "image_") {
+				isImage := key == "image" || key == "input_reference" || strings.HasPrefix(key, "image_")
+				isVideo := key == "video" || strings.HasPrefix(key, "video_")
+				isAudio := key == "audio" || strings.HasPrefix(key, "audio_")
+				if !isImage && !isVideo && !isAudio {
 					continue
 				}
 				for _, fh := range fhs {
@@ -610,10 +613,26 @@ func (s *Server) buildFreeVideoCreateRequest(r *http.Request) (*http.Request, st
 					if len(b) == 0 {
 						continue
 					}
-					idx++
-					name := "image"
-					if idx > 1 {
-						name = fmt.Sprintf("image_%d", idx)
+					var name string
+					switch {
+					case isVideo:
+						vidIdx++
+						name = "video"
+						if vidIdx > 1 {
+							name = fmt.Sprintf("video_%d", vidIdx)
+						}
+					case isAudio:
+						audIdx++
+						name = "audio"
+						if audIdx > 1 {
+							name = fmt.Sprintf("audio_%d", audIdx)
+						}
+					default:
+						imgIdx++
+						name = "image"
+						if imgIdx > 1 {
+							name = fmt.Sprintf("image_%d", imgIdx)
+						}
 					}
 					files = append(files, namedFile{field: name, filename: fh.Filename, data: b})
 				}

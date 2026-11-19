@@ -62,8 +62,10 @@ export const FREE_VIDEO_CREATION_MODES = [
   {
     id: 'multimodal',
     label: '多模态参考',
-    hint: '混合图片作为创作参考（最多 9 张）',
+    hint: '图最多 9 / 视频最多 3 / 音频最多 3；提示词中输入 @ 引用素材',
     maxRefs: 9,
+    maxVideos: 3,
+    maxAudios: 3,
     needsRefs: true,
   },
   {
@@ -125,7 +127,42 @@ const FREE_IMAGE_KEY = 'first_frame'
 export const FREE_IMAGE_MAX_REFS = 10
 export const FREE_IMAGE_REF_KEYS = Array.from({ length: FREE_IMAGE_MAX_REFS }, (_, i) => `ref_${i + 1}`)
 export const FREE_VIDEO_MULTI_MAX_REFS = 9
+export const FREE_VIDEO_MULTI_MAX_VIDEOS = 3
+export const FREE_VIDEO_MULTI_MAX_AUDIOS = 3
 export const FREE_VIDEO_MULTI_REF_KEYS = FREE_IMAGE_REF_KEYS.slice(0, FREE_VIDEO_MULTI_MAX_REFS)
+export const FREE_VIDEO_VIDEO_KEYS = Array.from({ length: FREE_VIDEO_MULTI_MAX_VIDEOS }, (_, i) => `video_${i + 1}`)
+export const FREE_VIDEO_AUDIO_KEYS = Array.from({ length: FREE_VIDEO_MULTI_MAX_AUDIOS }, (_, i) => `audio_${i + 1}`)
+
+/** Official multimodal MIME/ext → image|video|audio|'' (aligned with Go ClassifyMediaKind). */
+export function classifyMediaFile(file) {
+  const mime = String(file?.type || '')
+    .toLowerCase()
+    .split(';')[0]
+    .trim()
+  const name = String(file?.name || '')
+  if (mime === 'image/jpeg' || mime === 'image/jpg' || mime === 'image/png') return 'image'
+  if (mime === 'video/mp4') return 'video'
+  if (
+    mime === 'audio/mpeg' ||
+    mime === 'audio/mp3' ||
+    mime === 'audio/wav' ||
+    mime === 'audio/x-wav' ||
+    mime === 'audio/wave'
+  ) {
+    return 'audio'
+  }
+  const ext = name.includes('.') ? name.slice(name.lastIndexOf('.')).toLowerCase() : ''
+  if (['.jpg', '.jpeg', '.png'].includes(ext)) return 'image'
+  if (ext === '.mp4') return 'video'
+  if (['.mp3', '.wav'].includes(ext)) return 'audio'
+  return ''
+}
+
+function mentionToken(kind, index) {
+  if (kind === 'video') return `@Video ${index}`
+  if (kind === 'audio') return `@Audio ${index}`
+  return `@Image ${index}`
+}
 
 /** Runow multi-model (submit_mode=qc) */
 const qcCategory = ref('VIDEO')
@@ -190,7 +227,7 @@ const canSubmit = computed(() => {
   if (channel.value === 'free') {
     const promptOK = String(freePrompt.value || '').trim().length >= 2
     if (freeKind.value === 'video' && freeVideoMode.value === 'multimodal') {
-      return promptOK && freeVideoRefCount.value > 0
+      return promptOK && freeVideoMediaCount.value > 0
     }
     return promptOK
   }
@@ -253,12 +290,56 @@ const freeVideoRefCount = computed(() => {
   return imageFiles.value[FREE_IMAGE_KEY] ? 1 : 0
 })
 
+const freeVideoVideoCount = computed(() =>
+  FREE_VIDEO_VIDEO_KEYS.reduce((n, k) => n + (imageFiles.value[k] ? 1 : 0), 0),
+)
+const freeVideoAudioCount = computed(() =>
+  FREE_VIDEO_AUDIO_KEYS.reduce((n, k) => n + (imageFiles.value[k] ? 1 : 0), 0),
+)
+const freeVideoMediaCount = computed(
+  () => freeVideoRefCount.value + freeVideoVideoCount.value + freeVideoAudioCount.value,
+)
+
+function mediaSlotsFor(keys, max) {
+  const filled = keys.filter((k) => !!imageFiles.value[k])
+  if (filled.length >= max) return filled
+  const nextEmpty = keys.find((k) => !imageFiles.value[k])
+  return nextEmpty ? [...filled, nextEmpty] : filled
+}
+
 const freeVideoRefSlots = computed(() => {
   if (freeVideoMode.value !== 'multimodal') return []
-  const filled = FREE_VIDEO_MULTI_REF_KEYS.filter((k) => !!imageFiles.value[k])
-  if (filled.length >= FREE_VIDEO_MULTI_MAX_REFS) return filled
-  const nextEmpty = FREE_VIDEO_MULTI_REF_KEYS.find((k) => !imageFiles.value[k])
-  return nextEmpty ? [...filled, nextEmpty] : filled
+  return mediaSlotsFor(FREE_VIDEO_MULTI_REF_KEYS, FREE_VIDEO_MULTI_MAX_REFS)
+})
+const freeVideoVideoSlots = computed(() => {
+  if (freeVideoMode.value !== 'multimodal') return []
+  return mediaSlotsFor(FREE_VIDEO_VIDEO_KEYS, FREE_VIDEO_MULTI_MAX_VIDEOS)
+})
+const freeVideoAudioSlots = computed(() => {
+  if (freeVideoMode.value !== 'multimodal') return []
+  return mediaSlotsFor(FREE_VIDEO_AUDIO_KEYS, FREE_VIDEO_MULTI_MAX_AUDIOS)
+})
+
+/** Assets available for @ picker: { kind, index, key, label, token } */
+const freeVideoMentionAssets = computed(() => {
+  if (freeVideoMode.value !== 'multimodal') return []
+  const out = []
+  FREE_VIDEO_MULTI_REF_KEYS.forEach((key, i) => {
+    if (!imageFiles.value[key]) return
+    const index = i + 1
+    out.push({ kind: 'image', index, key, label: `Image ${index}`, token: mentionToken('image', index) })
+  })
+  FREE_VIDEO_VIDEO_KEYS.forEach((key, i) => {
+    if (!imageFiles.value[key]) return
+    const index = i + 1
+    out.push({ kind: 'video', index, key, label: `Video ${index}`, token: mentionToken('video', index) })
+  })
+  FREE_VIDEO_AUDIO_KEYS.forEach((key, i) => {
+    if (!imageFiles.value[key]) return
+    const index = i + 1
+    out.push({ kind: 'audio', index, key, label: `Audio ${index}`, token: mentionToken('audio', index) })
+  })
+  return out
 })
 
 const primaryPreview = computed(() => {
@@ -516,51 +597,94 @@ async function selectTemplate(id, { keepFields = false, keepTask = false } = {})
   }
 }
 
+function expectedKindForKey(nodeId) {
+  const id = String(nodeId || '')
+  if (FREE_VIDEO_VIDEO_KEYS.includes(id)) return 'video'
+  if (FREE_VIDEO_AUDIO_KEYS.includes(id)) return 'audio'
+  return 'image'
+}
+
 function setImage(nodeId, file) {
   const id = String(nodeId || '').trim()
   if (!id) return
-  if (!file || !String(file.type || '').startsWith('image/')) {
-    error.value = '请选择图片文件'
+  const want = expectedKindForKey(id)
+  let next = file
+  if (!(file instanceof File) || !file.name) {
+    const mime = file?.type || (want === 'image' ? 'image/png' : '')
+    const ext = String(mime).split('/')[1] || (want === 'video' ? 'mp4' : want === 'audio' ? 'wav' : 'png')
+    next = new File([file], `paste_${Date.now()}.${ext}`, { type: mime || 'application/octet-stream' })
+  }
+  const kind = classifyMediaFile(next)
+  if (!kind) {
+    error.value = '不支持的文件类型（图: JPG/PNG，视频: MP4，音频: MP3/WAV）'
+    return
+  }
+  if (kind !== want) {
+    error.value =
+      want === 'video' ? '请选择 MP4 视频' : want === 'audio' ? '请选择 MP3/WAV 音频' : '请选择图片文件'
     return
   }
   error.value = ''
   const prev = imagePreviews.value[id]
   if (prev) URL.revokeObjectURL(prev)
-  // Normalize clipboard blobs (often unnamed) into a usable File.
-  let next = file
-  if (!(file instanceof File) || !file.name) {
-    const ext = String(file.type || 'image/png').split('/')[1] || 'png'
-    next = new File([file], `paste_${Date.now()}.${ext}`, { type: file.type || 'image/png' })
-  }
   imageFiles.value = { ...imageFiles.value, [id]: next }
   imagePreviews.value = { ...imagePreviews.value, [id]: URL.createObjectURL(next) }
 }
 
-/** Add pasted/dropped images into the current free/qc image slots. Returns count added. */
+function addMediaByKind(file) {
+  const kind = classifyMediaFile(file)
+  if (!kind) {
+    error.value = '不支持的文件类型（图: JPG/PNG，视频: MP4，音频: MP3/WAV）'
+    return false
+  }
+  let keys = FREE_VIDEO_MULTI_REF_KEYS
+  let max = FREE_VIDEO_MULTI_MAX_REFS
+  let label = '参考图'
+  if (kind === 'video') {
+    keys = FREE_VIDEO_VIDEO_KEYS
+    max = FREE_VIDEO_MULTI_MAX_VIDEOS
+    label = '参考视频'
+  } else if (kind === 'audio') {
+    keys = FREE_VIDEO_AUDIO_KEYS
+    max = FREE_VIDEO_MULTI_MAX_AUDIOS
+    label = '参考音频'
+  }
+  const empty = keys.find((k) => !imageFiles.value[k])
+  if (!empty) {
+    error.value = `${label}已满（最多 ${max}）`
+    return false
+  }
+  setImage(empty, file)
+  return true
+}
+
+/** Add pasted/dropped media into current slots. Returns count added. */
 function addPastedImages(fileList) {
-  const files = [...(fileList || [])].filter((f) => f && String(f.type || '').startsWith('image/'))
+  const files = [...(fileList || [])].filter(Boolean)
   if (!files.length) return 0
 
-  // Free video multimodal: fill up to 9 refs; freeCreation: single first-frame.
+  // Free video multimodal: auto-classify image/video/audio into typed pools.
   if (channel.value === 'free' && freeKind.value === 'video') {
     if (freeVideoMode.value === 'multimodal') {
       let added = 0
       for (const file of files) {
-        const empty = FREE_VIDEO_MULTI_REF_KEYS.find((k) => !imageFiles.value[k])
-        if (!empty) break
-        setImage(empty, file)
-        added += 1
+        if (addMediaByKind(file)) added += 1
       }
-      if (added === 0) error.value = `参考图已满（最多 ${FREE_VIDEO_MULTI_MAX_REFS} 张）`
       return added
     }
-    setImage(FREE_IMAGE_KEY, files[0])
+    const images = files.filter((f) => classifyMediaFile(f) === 'image' || String(f.type || '').startsWith('image/'))
+    if (!images.length) {
+      error.value = '自由创作请上传图片'
+      return 0
+    }
+    setImage(FREE_IMAGE_KEY, images[0])
     return 1
   }
 
   // Free image / Runow QC: fill empty ref slots in order (max 10).
+  const images = files.filter((f) => classifyMediaFile(f) === 'image' || String(f.type || '').startsWith('image/'))
   let added = 0
-  for (const file of files) {
+  for (const file of images) {
     const empty = FREE_IMAGE_REF_KEYS.find((k) => !imageFiles.value[k])
     if (!empty) break
     setImage(empty, file)
@@ -684,7 +808,7 @@ async function submit() {
       if (freeKind.value === 'image') {
         error.value = '官方免费生图需要提示词（参考图可选）'
       } else if (freeVideoMode.value === 'multimodal') {
-        error.value = '多模态参考需要提示词 + 至少一张参考图'
+        error.value = '多模态参考需要提示词 + 至少一个参考素材（图/视频/音频）'
       } else {
         error.value = '自由创作需要提示词（参考图可选）'
       }
@@ -735,6 +859,16 @@ async function submit() {
           refs.forEach((file, i) => {
             if (i === 0) fd.append('image', file)
             else fd.append(`image_${i + 1}`, file)
+          })
+          const videos = FREE_VIDEO_VIDEO_KEYS.map((k) => imageFiles.value[k]).filter(Boolean)
+          videos.forEach((file, i) => {
+            if (i === 0) fd.append('video', file)
+            else fd.append(`video_${i + 1}`, file)
+          })
+          const audios = FREE_VIDEO_AUDIO_KEYS.map((k) => imageFiles.value[k]).filter(Boolean)
+          audios.forEach((file, i) => {
+            if (i === 0) fd.append('audio', file)
+            else fd.append(`audio_${i + 1}`, file)
           })
         } else {
           const file = imageFiles.value[FREE_IMAGE_KEY]
@@ -862,9 +996,21 @@ export function useStudioStore() {
     freeVideoModeMeta,
     FREE_VIDEO_CREATION_MODES,
     FREE_VIDEO_MULTI_MAX_REFS,
+    FREE_VIDEO_MULTI_MAX_VIDEOS,
+    FREE_VIDEO_MULTI_MAX_AUDIOS,
     FREE_VIDEO_MULTI_REF_KEYS,
+    FREE_VIDEO_VIDEO_KEYS,
+    FREE_VIDEO_AUDIO_KEYS,
+    classifyMediaFile,
     freeVideoRefCount,
+    freeVideoVideoCount,
+    freeVideoAudioCount,
+    freeVideoMediaCount,
     freeVideoRefSlots,
+    freeVideoVideoSlots,
+    freeVideoAudioSlots,
+    freeVideoMentionAssets,
+    addMediaByKind,
     setFreeVideoMode,
     freePrompt,
     freeDuration,

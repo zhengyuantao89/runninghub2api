@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,6 +23,8 @@ const (
 	DefaultQCFreeMultiSkuID      = "2102602670923161601"
 	DefaultQCFreeVideoName       = "Minimax H3-RH Enhanced"
 	DefaultQCFreeVideoMaxRefs    = 9 // multimodal refImage1..9
+	DefaultQCFreeVideoMaxVideos  = 3 // multimodal refVideo1..3
+	DefaultQCFreeVideoMaxAudios  = 3 // multimodal refAudio1..3
 	QCFreeVideoModeFreeCreation  = "freeCreation"
 	QCFreeVideoModeMultimodal    = "multimodal"
 	// Official free image families (HAR): same family, with refs → i2i sku, without → t2i sku.
@@ -259,10 +262,10 @@ func (c *Client) StorageGetCredentials(scene string) (QCStorageCreds, error) {
 	return out, nil
 }
 
-// UploadQCImage uploads to QC COS and returns the public CDN URL.
-func (c *Client) UploadQCImage(data []byte, filename string) (string, error) {
+// UploadQCFile uploads any QC media (image/video/audio) to COS and returns the public CDN URL.
+func (c *Client) UploadQCFile(data []byte, filename string) (string, error) {
 	if len(data) == 0 {
-		return "", fmt.Errorf("image bytes required")
+		return "", fmt.Errorf("file bytes required")
 	}
 	cred, err := c.StorageGetCredentials("qc")
 	if err != nil {
@@ -270,7 +273,7 @@ func (c *Client) UploadQCImage(data []byte, filename string) (string, error) {
 	}
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext == "" {
-		ext = ".png"
+		ext = ".bin"
 	}
 	sum := md5.Sum(data)
 	key := fmt.Sprintf("%s/uploads/%s%s", cred.Identify, hex.EncodeToString(sum[:]), ext)
@@ -288,6 +291,20 @@ func (c *Client) UploadQCImage(data []byte, filename string) (string, error) {
 	return cdn + "/" + key, nil
 }
 
+// UploadQCImage uploads an image to QC COS and returns the public CDN URL.
+func (c *Client) UploadQCImage(data []byte, filename string) (string, error) {
+	if len(data) == 0 {
+		return "", fmt.Errorf("image bytes required")
+	}
+	if strings.TrimSpace(filepath.Ext(filename)) == "" {
+		filename = strings.TrimSpace(filename) + ".png"
+		if filename == ".png" {
+			filename = "image.png"
+		}
+	}
+	return c.UploadQCFile(data, filename)
+}
+
 func (c *Client) QCFeePreview(body map[string]any) (QCFeePreview, map[string]any, error) {
 	raw, err := c.postJSON("/qc-service/task/quick-creation/fee-preview", body)
 	if err != nil {
@@ -297,9 +314,34 @@ func (c *Client) QCFeePreview(body map[string]any) (QCFeePreview, map[string]any
 	return parseQCFeePreview(data), data, nil
 }
 
+// qcProjectNameMax matches Runow UI: project/create uses a short display name
+// (HAR 2026-11-19: ~22 runes + "…"). Full prompt stays in params.prompt only.
+// Passing the full long prompt as name returns http=200 code=500 UNKNOWN_ERROR
+// once length exceeds RH's ~255 limit.
+const qcProjectNameMax = 22
+
+func sanitizeQCProjectName(name string) string {
+	s := strings.TrimSpace(strings.TrimPrefix(name, "\ufeff"))
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	for strings.Contains(s, "  ") {
+		s = strings.ReplaceAll(s, "  ", " ")
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "qc"
+	}
+	runes := []rune(s)
+	if len(runes) <= qcProjectNameMax {
+		return s
+	}
+	return string(runes[:qcProjectNameMax]) + "…"
+}
+
 func (c *Client) QCProjectCreate(name string) (projectID string, err error) {
 	raw, err := c.postJSON("/qc-service/task/quick-creation/v2/canvas/project/create", map[string]any{
-		"name": firstNonEmpty(strings.TrimSpace(name), "qc"),
+		"name": sanitizeQCProjectName(name),
 	})
 	if err != nil {
 		return "", err
@@ -437,6 +479,27 @@ func normalizeQCResolution(v string) string {
 	}
 }
 
+// qcFreeVideoMegapixels maps UI labels to Minimax H3-RH Enhanced ResolutionSelector values
+// (HAR 2026-11-19 models fields: label 480p/768p/1080p → megapixels floats).
+func qcFreeVideoMegapixels(v string) float64 {
+	s := strings.ToLower(strings.TrimSpace(v))
+	switch s {
+	case "480", "480p", "0.135164359862":
+		return 0.135164359862
+	case "768", "768p", "0.346020761246":
+		return 0.346020761246
+	case "1080", "1080p", "0.684269571799":
+		return 0.684269571799
+	case "":
+		return 0.684269571799 // model default
+	default:
+		if f, err := strconv.ParseFloat(s, 64); err == nil && f > 0 {
+			return f
+		}
+		return 0.684269571799
+	}
+}
+
 func clampQCDuration(n int) int {
 	if n < 4 {
 		return 4
@@ -475,7 +538,31 @@ func ResolveQCFreeVideoModel(mode string, imageCount int) (bindingID, skuID, cre
 	return DefaultQCFreeT2VBindingID, DefaultQCFreeT2VSkuID, creationMode
 }
 
-func buildQCFreeCreateRequest(prompt string, imageURLs []string, aspect, duration, resolution, mode, projectID, pageID, clientReqID string) map[string]any {
+func filterNonEmptyURLs(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, u := range in {
+		u = strings.TrimSpace(u)
+		if u != "" {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+func assignRefParams(params map[string]any, prefix string, urls []string, max int) {
+	if max <= 0 {
+		return
+	}
+	n := len(urls)
+	if n > max {
+		n = max
+	}
+	for i := 0; i < n; i++ {
+		params[fmt.Sprintf("%s%d", prefix, i+1)] = urls[i]
+	}
+}
+
+func buildQCFreeCreateRequest(prompt string, imageURLs, videoURLs, audioURLs []string, aspect, duration, resolution, mode, projectID, pageID, clientReqID string) map[string]any {
 	prompt = strings.TrimSpace(strings.TrimPrefix(prompt, "\ufeff"))
 	aspect = strings.TrimSpace(aspect)
 	if aspect == "" {
@@ -488,34 +575,24 @@ func buildQCFreeCreateRequest(prompt string, imageURLs []string, aspect, duratio
 		}
 	}
 	dur = clampQCDuration(dur)
-	res := normalizeQCResolution(resolution)
-	urls := make([]string, 0, len(imageURLs))
-	for _, u := range imageURLs {
-		u = strings.TrimSpace(u)
-		if u != "" {
-			urls = append(urls, u)
-		}
-	}
-	bindingID, skuID, creationMode := ResolveQCFreeVideoModel(mode, len(urls))
+	images := filterNonEmptyURLs(imageURLs)
+	videos := filterNonEmptyURLs(videoURLs)
+	audios := filterNonEmptyURLs(audioURLs)
+	bindingID, skuID, creationMode := ResolveQCFreeVideoModel(mode, len(images))
 	params := map[string]any{
-		"prompt":         prompt,
-		"aspectRatio":    aspect,
-		"resolution":     res,
-		"duration":       dur,
-		"audioMode":      "native",
-		"73##megapixels": res,
-		"creationMode":   creationMode,
+		"prompt":       prompt,
+		"aspectRatio":  aspect,
+		"resolution":   qcFreeVideoMegapixels(resolution),
+		"duration":     dur,
+		"audioMode":    "native",
+		"creationMode": creationMode,
 	}
 	if creationMode == QCFreeVideoModeMultimodal {
-		max := DefaultQCFreeVideoMaxRefs
-		if len(urls) < max {
-			max = len(urls)
-		}
-		for i := 0; i < max; i++ {
-			params[fmt.Sprintf("refImage%d", i+1)] = urls[i]
-		}
-	} else if len(urls) > 0 {
-		params["firstFrameUrl"] = urls[0]
+		assignRefParams(params, "refImage", images, DefaultQCFreeVideoMaxRefs)
+		assignRefParams(params, "refVideo", videos, DefaultQCFreeVideoMaxVideos)
+		assignRefParams(params, "refAudio", audios, DefaultQCFreeVideoMaxAudios)
+	} else if len(images) > 0 {
+		params["firstFrameUrl"] = images[0]
 	}
 	return map[string]any{
 		"categoryId":      "VIDEO",
@@ -568,8 +645,10 @@ func SubmitQCFreeVideo(in RunInput) (*Session, error) {
 	mode = NormalizeQCFreeVideoMode(mode)
 
 	imageURLs := make([]string, 0, 8)
+	videoURLs := make([]string, 0, 4)
+	audioURLs := make([]string, 0, 4)
 	seen := map[string]struct{}{}
-	addURL := func(u string) {
+	addURL := func(dst *[]string, u string) {
 		u = strings.TrimSpace(u)
 		if u == "" {
 			return
@@ -578,66 +657,127 @@ func SubmitQCFreeVideo(in RunInput) (*Session, error) {
 			return
 		}
 		seen[u] = struct{}{}
-		imageURLs = append(imageURLs, u)
+		*dst = append(*dst, u)
 	}
 	if u := strings.TrimSpace(in.FirstFrameURL); u != "" {
-		addURL(u)
+		addURL(&imageURLs, u)
 	}
 	type namedBytes struct {
+		kind string
 		name string
 		data []byte
 	}
-	uploads := make([]namedBytes, 0, 8)
+	uploads := make([]namedBytes, 0, 12)
 	if img, filename, err := loadDefaultImage(in); err == nil && len(img) > 0 {
-		uploads = append(uploads, namedBytes{name: filename, data: img})
+		uploads = append(uploads, namedBytes{kind: MediaKindImage, name: filename, data: img})
 	}
 	for key, raw := range in.ExtraImages {
 		if len(raw) == 0 {
 			continue
 		}
-		name := strings.TrimSpace(key) + ".png"
-		if name == ".png" {
+		name := strings.TrimSpace(key)
+		if filepath.Ext(name) == "" {
+			name = name + ".png"
+		}
+		if name == ".png" || name == "" {
 			name = "ref.png"
 		}
-		uploads = append(uploads, namedBytes{name: name, data: raw})
+		kind := ClassifyMediaKind(name, "")
+		if kind == "" {
+			kind = MediaKindImage
+		}
+		uploads = append(uploads, namedBytes{kind: kind, name: name, data: raw})
 	}
 	for _, n := range in.NodeInfoList {
-		if strings.ToUpper(strings.TrimSpace(n.FieldType)) != "IMAGE" {
-			continue
-		}
+		ft := strings.ToUpper(strings.TrimSpace(n.FieldType))
 		path := strings.TrimSpace(fmt.Sprint(n.FieldValue))
 		if path == "" || path == "<nil>" {
 			continue
 		}
+		kind := ""
+		switch ft {
+		case "IMAGE":
+			kind = MediaKindImage
+		case "VIDEO":
+			kind = MediaKindVideo
+		case "AUDIO":
+			kind = MediaKindAudio
+		default:
+			continue
+		}
 		if strings.HasPrefix(path, "http") {
-			addURL(path)
+			switch kind {
+			case MediaKindImage:
+				addURL(&imageURLs, path)
+			case MediaKindVideo:
+				addURL(&videoURLs, path)
+			case MediaKindAudio:
+				addURL(&audioURLs, path)
+			}
 			continue
 		}
 		raw, err := os.ReadFile(path)
 		if err != nil || len(raw) == 0 {
 			continue
 		}
-		uploads = append(uploads, namedBytes{name: filepath.Base(path), data: raw})
+		name := filepath.Base(path)
+		if ClassifyMediaKind(name, "") == "" {
+			switch kind {
+			case MediaKindVideo:
+				name = strings.TrimSuffix(name, filepath.Ext(name)) + ".mp4"
+			case MediaKindAudio:
+				name = strings.TrimSuffix(name, filepath.Ext(name)) + ".wav"
+			default:
+				name = strings.TrimSuffix(name, filepath.Ext(name)) + ".png"
+			}
+		}
+		uploads = append(uploads, namedBytes{kind: kind, name: name, data: raw})
 	}
-	maxUploads := 1
+	maxImages := 1
+	maxVideos := 0
+	maxAudios := 0
 	if mode == QCFreeVideoModeMultimodal {
-		maxUploads = DefaultQCFreeVideoMaxRefs
+		maxImages = DefaultQCFreeVideoMaxRefs
+		maxVideos = DefaultQCFreeVideoMaxVideos
+		maxAudios = DefaultQCFreeVideoMaxAudios
 	}
-	if len(uploads) > maxUploads {
-		uploads = uploads[:maxUploads]
-	}
+	countKind := map[string]int{}
 	for _, u := range uploads {
-		cdn, err := client.UploadQCImage(u.data, u.name)
+		limit := maxImages
+		switch u.kind {
+		case MediaKindVideo:
+			limit = maxVideos
+		case MediaKindAudio:
+			limit = maxAudios
+		}
+		if countKind[u.kind] >= limit {
+			continue
+		}
+		cdn, err := client.UploadQCFile(u.data, u.name)
 		if err != nil {
 			return nil, err
 		}
-		addURL(cdn)
+		countKind[u.kind]++
+		switch u.kind {
+		case MediaKindVideo:
+			addURL(&videoURLs, cdn)
+		case MediaKindAudio:
+			addURL(&audioURLs, cdn)
+		default:
+			addURL(&imageURLs, cdn)
+		}
 	}
-	if mode == QCFreeVideoModeMultimodal && len(imageURLs) == 0 {
-		return nil, fmt.Errorf("多模态参考至少需要一张参考图")
+	if len(imageURLs) > maxImages {
+		imageURLs = imageURLs[:maxImages]
 	}
-	if len(imageURLs) > maxUploads {
-		imageURLs = imageURLs[:maxUploads]
+	if len(videoURLs) > maxVideos {
+		videoURLs = videoURLs[:maxVideos]
+	}
+	if len(audioURLs) > maxAudios {
+		audioURLs = audioURLs[:maxAudios]
+	}
+	if mode == QCFreeVideoModeMultimodal && len(imageURLs)+len(videoURLs)+len(audioURLs) == 0 {
+		return nil, fmt.Errorf("多模态参考至少需要一个参考素材（图/视频/音频）")
 	}
 
 	projectID, err := client.QCProjectCreate(prompt)
@@ -649,7 +789,7 @@ func SubmitQCFreeVideo(in RunInput) (*Session, error) {
 		return nil, err
 	}
 	clientReqID := randomUUIDLike()
-	createReq := buildQCFreeCreateRequest(prompt, imageURLs, in.AspectRatio, in.Duration, in.Resolution, mode, projectID, pageID, clientReqID)
+	createReq := buildQCFreeCreateRequest(prompt, imageURLs, videoURLs, audioURLs, in.AspectRatio, in.Duration, in.Resolution, mode, projectID, pageID, clientReqID)
 	skuID := asString(createReq["skuId"])
 
 	feeBody := map[string]any{

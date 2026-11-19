@@ -25,6 +25,8 @@ const batchBusy = ref(false)
 const showImport = ref(false)
 const showAdd = ref(false)
 const keyword = ref('')
+const statusFilter = ref('')
+const dispatchFilter = ref('')
 const page = ref(1)
 const pageSize = ref(50)
 const total = ref(0)
@@ -39,8 +41,34 @@ const actionMenuRow = ref(null)
 const selectedIds = ref(new Set())
 const detail = ref(null)
 const detailLoading = ref(false)
-const detailMaxConcurrency = ref(1)
-const savingConcurrency = ref(false)
+const detailSaving = ref(false)
+const detailForm = reactive({
+  email: '',
+  password: '',
+  access_token: '',
+  refresh_token: '',
+  api_key: '',
+  nick_name: '',
+  status: 'active',
+  source: '',
+  external_id: '',
+  max_concurrency: 1,
+  egress_id: 0,
+})
+
+function fillDetailForm(a) {
+  detailForm.email = a?.email || ''
+  detailForm.password = a?.password || ''
+  detailForm.access_token = a?.access_token || ''
+  detailForm.refresh_token = a?.refresh_token || ''
+  detailForm.api_key = a?.api_key || ''
+  detailForm.nick_name = a?.nick_name || ''
+  detailForm.status = a?.status === 'disabled' ? 'disabled' : 'active'
+  detailForm.source = a?.source || ''
+  detailForm.external_id = a?.external_id || ''
+  detailForm.max_concurrency = Number(a?.max_concurrency) || 1
+  detailForm.egress_id = Number(a?.egress_id) || 0
+}
 const headerCheckEl = ref(null)
 const toolbarButtonClass = 'h-8 justify-center px-3 text-xs'
 const copiedKey = ref('')
@@ -53,7 +81,7 @@ function placeActionMenu(anchorEl) {
   }
   const rect = anchorEl.getBoundingClientRect()
   const menuWidth = 132
-  const menuHeight = 152
+  const menuHeight = 196
   const gap = 4
   const left = Math.min(
     Math.max(8, rect.right - menuWidth),
@@ -97,9 +125,12 @@ async function runRowAction(row, action) {
   closeActionMenu()
   if (action === 'detail') return openDetail(row)
   if (action === 'ensureKey') return ensureKeyOne(row)
+  if (action === 'editNick') return editNickOne(row)
   if (action === 'refresh') return refreshOne(row)
   if (action === 'claim') return claimOne(row)
-  if (action === 'toggleStatus') return toggleStatus(row)
+  if (action === 'enable') return enableOne(row)
+  if (action === 'disable') return disableOne(row)
+  if (action === 'clearCooldown') return clearCooldownOne(row)
   if (action === 'delete') return deleteOne(row)
 }
 
@@ -115,18 +146,58 @@ const addForm = reactive({
   external_id: '',
 })
 
+const quotaStats = ref({
+  image_remaining: 0,
+  image_total: 0,
+  video_remaining: 0,
+  video_total: 0,
+  points: 0,
+  coins: 0,
+  with_image: 0,
+  with_video: 0,
+  with_points: 0,
+  accounts: 0,
+})
+
+function fmtQuotaNum(n) {
+  const v = Number(n || 0)
+  if (!Number.isFinite(v)) return '0'
+  if (Number.isInteger(v)) return String(v)
+  return v.toFixed(1).replace(/\.0$/, '')
+}
+
 const metricItems = computed(() => {
   const list = rows.value || []
   const active = list.filter((x) => x.dispatchable).length
   const busy = list.filter((x) => x.busy).length
-  const cooldown = list.filter((x) => x.cooldown_until).length
-  const failed = list.filter((x) => Number(x.fail_count || 0) > 0).length
+  const qs = quotaStats.value || {}
   return [
     { key: 'total', label: '号池总数', value: total.value },
     { key: 'active', label: '本页可调度', value: active },
     { key: 'busy', label: '本页占用', value: busy },
-    { key: 'cool', label: '本页冷却', value: cooldown },
-    { key: 'fail', label: '本页有失败', value: failed },
+    {
+      key: 'image',
+      label: '图片额度',
+      value: `${fmtQuotaNum(qs.image_remaining)}/${fmtQuotaNum(qs.image_total)}`,
+      meta: `有余量 ${qs.with_image || 0} 号`,
+    },
+    {
+      key: 'video',
+      label: '视频额度',
+      value: `${fmtQuotaNum(qs.video_remaining)}/${fmtQuotaNum(qs.video_total)}`,
+      meta: `有余量 ${qs.with_video || 0} 号`,
+    },
+    {
+      key: 'points',
+      label: '积分合计',
+      value: fmtQuotaNum(qs.points),
+      meta: `有积分 ${qs.with_points || 0} 号`,
+    },
+    {
+      key: 'coins',
+      label: 'RH 币合计',
+      value: fmtQuotaNum(qs.coins),
+    },
   ]
 })
 
@@ -165,11 +236,10 @@ const detailFields = computed(() => {
   const a = detail.value
   if (!a) return []
   const dash = (v) => (v == null || v === '' ? '—' : String(v))
+  // Read-only meta (editable fields live in the form above).
   return [
     { label: 'ID', value: dash(a.id), copy: true, mono: true },
     { label: '归属用户', value: dash(a.owner || (a.user_id ? `#${a.user_id}` : '')) },
-    { label: '邮箱', value: dash(a.email), copy: true },
-    { label: '状态', value: dash(a.status) },
     { label: '可调度', value: a.dispatchable ? '是' : '否' },
     { label: '占用中', value: a.busy ? '是' : '否' },
     { label: '计费体系', value: dash(a.billing_version || 'OLD') },
@@ -178,12 +248,9 @@ const detailFields = computed(() => {
     { label: '图片', value: freeQuotaLabel(a.free_image_remaining, a.free_image_total) },
     { label: '视频', value: freeQuotaLabel(a.free_video_remaining, a.free_video_total) },
     { label: '免费额度时间', value: dash(a.last_free_quota_at), mono: true },
-    { label: '并发上限', value: dash(a.max_concurrency || 1) },
     { label: '本网关在途', value: `${a.inflight || 0} / ${a.max_concurrency || 1}` },
     { label: 'RH 在途', value: dash(a.current_task_counts || '0') },
     { label: 'API Type', value: dash(a.api_type) },
-    { label: '来源', value: dash(a.source) },
-    { label: '外部 ID', value: dash(a.external_id), copy: !!a.external_id, mono: true },
     { label: 'RH User ID', value: dash(a.rh_user_id), copy: !!a.rh_user_id, mono: true },
     { label: 'Identify', value: dash(a.identify), copy: !!a.identify, mono: true },
     { label: '指纹', value: a.has_fingerprint || a.fingerprint_json ? '有' : '无' },
@@ -192,15 +259,11 @@ const detailFields = computed(() => {
     { label: '冷却至', value: dash(a.cooldown_until), mono: true },
     { label: '失败次数', value: dash(a.fail_count ?? 0) },
     { label: '最近余额时间', value: dash(a.last_balance_at), mono: true },
-    { label: '每日领取日', value: dash(a.last_login_coin_at), mono: true },
+    { label: '每日领取日', value: shortMonthDay(a.last_login_coin_at), mono: true },
     { label: 'Lease Task', value: dash(a.lease_task_id), mono: true, copy: !!a.lease_task_id },
     { label: 'Lease Until', value: dash(a.lease_until), mono: true },
     { label: '创建时间', value: dash(a.created_at), mono: true },
     { label: '更新时间', value: dash(a.updated_at), mono: true },
-    { label: '密码', value: dash(a.password), copy: !!a.password, mono: true, wide: true },
-    { label: 'API Key', value: dash(a.api_key), copy: !!a.api_key, mono: true, wide: true },
-    { label: 'Access Token (AT)', value: dash(a.access_token), copy: !!a.access_token, mono: true, wide: true },
-    { label: 'Refresh Token (RT)', value: dash(a.refresh_token), copy: !!a.refresh_token, mono: true, wide: true },
     { label: '最近错误', value: dash(a.last_error), wide: true, pre: true },
   ]
 })
@@ -271,6 +334,8 @@ async function refresh() {
       pageSize: pageSize.value,
       q: keyword.value.trim(),
       owner: ownerFilter.value.trim(),
+      status: statusFilter.value.trim(),
+      dispatch: dispatchFilter.value.trim(),
     })
     rows.value = res.data || []
     total.value = Number(res.total) || 0
@@ -278,6 +343,19 @@ async function refresh() {
     if (res.page_size) pageSize.value = Number(res.page_size) || pageSize.value
     const serverPage = Number(res.page) || 1
     page.value = pages.value === 0 ? 1 : Math.min(Math.max(1, serverPage), pages.value)
+    const qs = res.quota_stats || {}
+    quotaStats.value = {
+      image_remaining: Number(qs.image_remaining) || 0,
+      image_total: Number(qs.image_total) || 0,
+      video_remaining: Number(qs.video_remaining) || 0,
+      video_total: Number(qs.video_total) || 0,
+      points: Number(qs.points) || 0,
+      coins: Number(qs.coins) || 0,
+      with_image: Number(qs.with_image) || 0,
+      with_video: Number(qs.with_video) || 0,
+      with_points: Number(qs.with_points) || 0,
+      accounts: Number(qs.accounts) || 0,
+    }
   } catch (e) {
     error.value = e.message || String(e)
   } finally {
@@ -291,6 +369,16 @@ function onPageSizeChange() {
 }
 
 function onOwnerChange() {
+  page.value = 1
+  refresh()
+}
+
+function onStatusFilterChange() {
+  page.value = 1
+  refresh()
+}
+
+function onDispatchFilterChange() {
   page.value = 1
   refresh()
 }
@@ -398,12 +486,108 @@ async function ensureKeyOne(row) {
   }
 }
 
-async function toggleStatus(row) {
+async function editNickOne(row) {
+  if (!row?.id) return
+  const hint = row.nick_name ? `当前：${row.nick_name}。` : ''
+  const input = window.prompt(`${hint}输入新昵称（留空则随机生成）`, row.nick_name || '')
+  if (input === null) return
+  error.value = ''
+  okmsg.value = ''
+  busyId.value = row.id
+  try {
+    const res = await api.editAccountNickname(row.id, String(input || '').trim())
+    okmsg.value = `已改昵称：${res?.result?.nick_name || input || row.email}`
+    await refresh()
+    if (detail.value?.id === row.id) {
+      detail.value = await api.getAccount(row.id)
+    }
+  } catch (e) {
+    error.value = e.message || String(e)
+  } finally {
+    busyId.value = 0
+  }
+}
+
+async function batchEditNickname() {
+  const list = selectedRows()
+  if (!list.length) {
+    error.value = '请先勾选账号'
+    return
+  }
+  if (!window.confirm(`为选中的 ${list.length} 个账号随机生成并提交新昵称？`)) return
+  error.value = ''
+  okmsg.value = ''
+  batchBusy.value = true
+  try {
+    const res = await api.editAccountsNickname(list.map((r) => r.id), '')
+    await refresh()
+    okmsg.value = `改昵称：成功 ${res.success || 0}，失败 ${res.failed || 0}`
+    if (Number(res.failed || 0) > 0) {
+      const fails = (res.results || [])
+        .filter((x) => !x.ok)
+        .slice(0, 5)
+        .map((x) => `${x.email || x.id}: ${x.error}`)
+      error.value = fails.join('；')
+    }
+  } catch (e) {
+    error.value = e.message || String(e)
+  } finally {
+    batchBusy.value = false
+  }
+}
+
+function isDispatchPaused(row) {
+  return !!row?.dispatch_paused
+}
+
+function canResumeDispatch(row) {
+  if (!row?.id) return false
+  if (isDispatchPaused(row)) return true
+  return String(row.status || '').toLowerCase() === 'disabled'
+}
+
+function canPauseDispatch(row) {
+  return !!row?.id && !isDispatchPaused(row) && String(row.status || '').toLowerCase() === 'active'
+}
+
+function hasCooldown(row) {
+  return !!String(row?.cooldown_until || '').trim()
+}
+
+async function enableOne(row) {
+  if (!canResumeDispatch(row)) return
   error.value = ''
   busyId.value = row.id
   try {
-    if (row.status === 'active') await api.disableAccount(row.id)
-    else await api.enableAccount(row.id)
+    await api.enableAccount(row.id)
+    await refresh()
+  } catch (e) {
+    error.value = e.message || String(e)
+  } finally {
+    busyId.value = 0
+  }
+}
+
+async function disableOne(row) {
+  if (!canPauseDispatch(row)) return
+  error.value = ''
+  busyId.value = row.id
+  try {
+    await api.disableAccount(row.id)
+    await refresh()
+  } catch (e) {
+    error.value = e.message || String(e)
+  } finally {
+    busyId.value = 0
+  }
+}
+
+async function clearCooldownOne(row) {
+  if (!row?.id || !hasCooldown(row)) return
+  error.value = ''
+  busyId.value = row.id
+  try {
+    await api.clearAccountCooldown(row.id)
     await refresh()
   } catch (e) {
     error.value = e.message || String(e)
@@ -437,8 +621,8 @@ async function deleteOne(row) {
   }
 }
 
-async function runBatch(label, worker) {
-  const list = selectedRows()
+async function runBatch(label, worker, rows) {
+  const list = Array.isArray(rows) ? rows : selectedRows()
   if (!list.length) {
     error.value = '请先勾选账号'
     return
@@ -512,8 +696,8 @@ async function claimOne(row) {
 async function batchClaimDailyLogin() {
   const list = selectedRows()
   const ids = list.map((r) => r.id)
-  const scope = ids.length ? `选中的 ${ids.length} 个账号` : '全部活跃账号'
-  if (!window.confirm(`领取今日积分（${scope}；含因积分为 0 被禁用的号）？`)) {
+  const scope = ids.length ? `选中的 ${ids.length} 个账号` : '全部账号（含已禁用，禁用只挡任务调度）'
+  if (!window.confirm(`领取今日积分（${scope}）？`)) {
     return
   }
   error.value = ''
@@ -526,12 +710,40 @@ async function batchClaimDailyLogin() {
     await refresh()
     const total = Number(res.success || 0) + Number(res.skipped || 0) + Number(res.failed || 0)
     if (total === 0) {
-      runLog.warning('没有可领的号（要 active，或者因没币被禁但仍有 AT/密码）')
+      runLog.warning('没有可领的号（需有密码或 AT；禁用号也可领，禁用只挡调度）')
     }
   } catch (e) {
     const msg = e.message || String(e)
     runLog.error(`批量领取整组翻车了：${msg}`)
     error.value = msg
+  } finally {
+    batchBusy.value = false
+  }
+}
+
+async function batchBackfillFingerprint() {
+  const list = selectedRows()
+  const ids = list.length ? list.map((r) => r.id) : []
+  const scope = ids.length ? `选中 ${ids.length} 个` : '全部无指纹账号'
+  if (!window.confirm(`为${scope}补齐指纹 / anonymous_id / device_id？（已有字段不覆盖）`)) {
+    return
+  }
+  error.value = ''
+  okmsg.value = ''
+  batchBusy.value = true
+  try {
+    const res = await api.backfillFingerprints(ids)
+    await refresh()
+    okmsg.value = `补指纹：成功 ${res.success || 0}，跳过 ${res.skipped || 0}，失败 ${res.failed || 0}（扫描 ${res.total || 0}）`
+    if (Number(res.failed || 0) > 0) {
+      const fails = (res.results || [])
+        .filter((x) => !x.ok)
+        .slice(0, 5)
+        .map((x) => `${x.email || x.id}: ${x.error}`)
+      error.value = fails.join('；')
+    }
+  } catch (e) {
+    error.value = e.message || String(e)
   } finally {
     batchBusy.value = false
   }
@@ -583,26 +795,59 @@ async function batchEnsureKey() {
   }
 }
 
-async function batchToggleStatus() {
-  await runBatch('批量启用/禁用', async (row) => {
-    if (row.status === 'active') await api.disableAccount(row.id)
-    else await api.enableAccount(row.id)
-  })
+async function batchEnable() {
+  if (!selectedCount.value) {
+    error.value = '请先勾选账号'
+    return
+  }
+  const list = selectedRows().filter((row) => canResumeDispatch(row))
+  if (!list.length) {
+    error.value = '所选账号里没有可恢复调度的'
+    return
+  }
+  await runBatch('批量启用调度', (row) => api.enableAccount(row.id), list)
+}
+
+async function batchDisable() {
+  if (!selectedCount.value) {
+    error.value = '请先勾选账号'
+    return
+  }
+  const list = selectedRows().filter((row) => canPauseDispatch(row))
+  if (!list.length) {
+    error.value = '所选账号里没有可暂停调度的'
+    return
+  }
+  await runBatch('批量暂停调度', (row) => api.disableAccount(row.id), list)
+}
+
+async function batchClearCooldown() {
+  if (!selectedCount.value) {
+    error.value = '请先勾选账号'
+    return
+  }
+  const list = selectedRows().filter((row) => hasCooldown(row))
+  if (!list.length) {
+    error.value = '所选账号里没有处于冷却的'
+    return
+  }
+  await runBatch('批量清除冷却', (row) => api.clearAccountCooldown(row.id), list)
 }
 
 let detailRequestSeq = 0
 
 async function openDetail(row) {
   error.value = ''
+  okmsg.value = ''
   const seq = ++detailRequestSeq
   detailLoading.value = true
   detail.value = { id: row.id, email: row.email, status: row.status }
-  detailMaxConcurrency.value = Number(row.max_concurrency) || 1
+  fillDetailForm(row)
   try {
     const data = await api.getAccount(row.id)
     if (seq !== detailRequestSeq) return
     detail.value = data
-    detailMaxConcurrency.value = Number(data?.max_concurrency) || 1
+    fillDetailForm(data)
   } catch (e) {
     if (seq !== detailRequestSeq) return
     error.value = e.message || String(e)
@@ -618,22 +863,39 @@ function closeDetail() {
   detail.value = null
 }
 
-async function saveDetailConcurrency() {
+async function saveDetailAccount() {
   if (!detail.value?.id) return
   error.value = ''
   okmsg.value = ''
-  savingConcurrency.value = true
+  const email = String(detailForm.email || '').trim()
+  if (!email) {
+    error.value = '邮箱不能为空'
+    return
+  }
+  const maxConc = Math.min(64, Math.max(1, Number(detailForm.max_concurrency) || 1))
+  detailSaving.value = true
   try {
-    const n = Math.min(64, Math.max(1, Number(detailMaxConcurrency.value) || 1))
-    const acc = await api.setAccountMaxConcurrency(detail.value.id, n)
-    detail.value = { ...detail.value, ...acc }
-    detailMaxConcurrency.value = Number(acc.max_concurrency) || n
-    okmsg.value = `${acc.email || detail.value.email} 并发上限已设为 ${detailMaxConcurrency.value}`
+    const acc = await api.updateAccount(detail.value.id, {
+      email,
+      password: String(detailForm.password || ''),
+      access_token: String(detailForm.access_token || ''),
+      refresh_token: String(detailForm.refresh_token || ''),
+      api_key: String(detailForm.api_key || ''),
+      nick_name: String(detailForm.nick_name || ''),
+      status: detailForm.status === 'disabled' ? 'disabled' : 'active',
+      source: String(detailForm.source || ''),
+      external_id: String(detailForm.external_id || ''),
+      max_concurrency: maxConc,
+      egress_id: Number(detailForm.egress_id) || 0,
+    })
+    detail.value = acc
+    fillDetailForm(acc)
+    okmsg.value = `${acc.email || email} 已保存`
     await refresh()
   } catch (e) {
     error.value = e.message || String(e)
   } finally {
-    savingConcurrency.value = false
+    detailSaving.value = false
   }
 }
 
@@ -669,6 +931,17 @@ function freeQuotaLabel(remaining, total) {
   return `${Number(remaining || 0)}/${t}`
 }
 
+/** last_login_coin_at → 月-日，如 11-19 */
+function shortMonthDay(v) {
+  const s = String(v || '').trim()
+  if (!s) return '—'
+  const m = s.match(/(\d{4})-(\d{1,2})-(\d{1,2})/)
+  if (m) return `${Number(m[2])}-${Number(m[3])}`
+  const m2 = s.match(/(\d{1,2})[\/\-月](\d{1,2})/)
+  if (m2) return `${Number(m2[1])}-${Number(m2[2])}`
+  return s
+}
+
 function statusTone(status) {
   const s = String(status || '').toLowerCase()
   if (s === 'active') return 'success'
@@ -685,6 +958,7 @@ function statusLabel(status) {
 
 function dispatchTone(row) {
   if (row?.dispatchable) return 'success'
+  if (row?.dispatch_paused) return 'warning'
   if (row?.busy) return 'info'
   if (row?.cooldown_until) return 'warning'
   return 'error'
@@ -692,6 +966,7 @@ function dispatchTone(row) {
 
 function dispatchLabel(row) {
   if (row?.dispatchable) return '可调度'
+  if (row?.dispatch_paused) return '已暂停'
   if (row?.busy) return '占用中'
   if (row?.cooldown_until) return '冷却中'
   return '不可用'
@@ -738,7 +1013,7 @@ onUnmounted(() => {
 <template>
   <div class="relative space-y-5">
     <PagePanel class="space-y-5">
-      <MetricStrip :items="metricItems" columns-class="grid-cols-2 md:grid-cols-5" density="compact" />
+      <MetricStrip :items="metricItems" columns-class="grid-cols-2 md:grid-cols-4 xl:grid-cols-7" density="compact" />
 
       <div class="flex flex-col gap-3">
         <FilterToolbar :bordered="false">
@@ -758,6 +1033,27 @@ onUnmounted(() => {
           >
             <option value="">全部用户</option>
             <option v-for="name in ownerOptions" :key="name" :value="name">{{ name }}</option>
+          </select>
+          <select
+            v-model="statusFilter"
+            class="h-9 rounded-xl border border-border bg-background px-3 text-sm text-foreground"
+            @change="onStatusFilterChange"
+          >
+            <option value="">全部状态</option>
+            <option value="active">启用</option>
+            <option value="disabled">禁用</option>
+          </select>
+          <select
+            v-model="dispatchFilter"
+            class="h-9 rounded-xl border border-border bg-background px-3 text-sm text-foreground"
+            @change="onDispatchFilterChange"
+          >
+            <option value="">全部调度</option>
+            <option value="dispatchable">可调度</option>
+            <option value="unavailable">不可调度</option>
+            <option value="paused">已暂停</option>
+            <option value="cooldown">冷却中</option>
+            <option value="busy">占用中</option>
           </select>
           <label class="flex items-center gap-2 text-xs text-muted-foreground">
             每页
@@ -808,6 +1104,24 @@ onUnmounted(() => {
               variant="outline"
               :root-class="toolbarButtonClass"
               :disabled="batchBusy"
+              @click="batchBackfillFingerprint"
+            >
+              补指纹
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              :root-class="toolbarButtonClass"
+              :disabled="batchBusy || !selectedCount"
+              @click="batchEditNickname"
+            >
+              批量改昵称
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              :root-class="toolbarButtonClass"
+              :disabled="batchBusy"
               @click="batchClaimDailyLogin"
             >
               领每日积分
@@ -817,9 +1131,27 @@ onUnmounted(() => {
               variant="outline"
               :root-class="toolbarButtonClass"
               :disabled="batchBusy || !selectedCount"
-              @click="batchToggleStatus"
+              @click="batchEnable"
             >
-              启用/禁用
+              批量启用调度
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              :root-class="toolbarButtonClass"
+              :disabled="batchBusy || !selectedCount"
+              @click="batchDisable"
+            >
+              批量暂停调度
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              :root-class="toolbarButtonClass"
+              :disabled="batchBusy || !selectedCount"
+              @click="batchClearCooldown"
+            >
+              批量清除冷却
             </Button>
             <Button size="sm" :root-class="toolbarButtonClass" @click="openAdd">
               添加账号
@@ -865,6 +1197,7 @@ onUnmounted(() => {
               <th class="py-3 pr-5">账号</th>
               <th v-if="isAdmin" class="py-3 pr-5">归属</th>
               <th class="py-3 px-3 text-center">Token</th>
+              <th class="py-3 px-3 text-center">Key</th>
               <th class="py-3 pr-5">状态</th>
               <th class="py-3 pr-5">可调度</th>
               <th class="py-3 pr-5">体系</th>
@@ -877,10 +1210,7 @@ onUnmounted(() => {
               <th class="py-3 px-3 text-center">出口</th>
               <th class="py-3 px-3 text-center">并发</th>
               <th class="py-3 px-3 text-center">RH在途</th>
-              <th class="py-3 px-3 text-center">Key</th>
               <th class="py-3 px-3 text-center">冷却</th>
-              <th class="py-3 px-3 text-center">失败</th>
-              <th class="py-3 pr-5">来源</th>
               <th class="py-3 pl-3 text-center">操作</th>
             </tr>
           </thead>
@@ -913,6 +1243,14 @@ onUnmounted(() => {
                   <TonePill :tone="tokenTone(a.has_refresh_token)" :label="tokenLabel('RT', a.has_refresh_token)" />
                 </div>
               </td>
+              <td class="px-3 py-3 text-center">
+                <div class="inline-flex justify-center">
+                  <TonePill
+                    :tone="a.has_api_key ? 'success' : 'error'"
+                    :label="a.has_api_key ? (a.api_type || '有Key') : '无Key'"
+                  />
+                </div>
+              </td>
               <td class="py-3 pr-5">
                 <TonePill :tone="statusTone(a.status)" :label="statusLabel(a.status)" />
               </td>
@@ -924,11 +1262,11 @@ onUnmounted(() => {
               <td class="py-3 pr-5">{{ a.remain_points || '—' }}</td>
               <td class="py-3 pr-5 font-mono text-xs">{{ freeQuotaLabel(a.free_image_remaining, a.free_image_total) }}</td>
               <td class="py-3 pr-5 font-mono text-xs">{{ freeQuotaLabel(a.free_video_remaining, a.free_video_total) }}</td>
-              <td class="py-3 pr-5 font-mono text-xs text-muted-foreground">{{ a.last_login_coin_at || '—' }}</td>
+              <td class="py-3 pr-5 font-mono text-xs text-muted-foreground">{{ shortMonthDay(a.last_login_coin_at) }}</td>
               <td class="py-3 pr-5">
                 <TonePill
                   :tone="a.has_fingerprint ? 'success' : 'neutral'"
-                  :label="a.has_fingerprint ? '有指纹' : '无'"
+                  :label="a.has_fingerprint ? '有' : '无'"
                 />
               </td>
               <td class="px-3 py-3 text-center font-mono text-xs text-muted-foreground">{{ a.egress_label || '—' }}</td>
@@ -936,17 +1274,7 @@ onUnmounted(() => {
                 {{ a.inflight || 0 }}/{{ a.max_concurrency || 1 }}
               </td>
               <td class="px-3 py-3 text-center">{{ a.current_task_counts || '0' }}</td>
-              <td class="px-3 py-3 text-center">
-                <div class="inline-flex justify-center">
-                  <TonePill
-                    :tone="a.has_api_key ? 'success' : 'error'"
-                    :label="a.has_api_key ? (a.api_type || '有Key') : '无Key'"
-                  />
-                </div>
-              </td>
               <td class="px-3 py-3 text-center font-mono text-xs text-muted-foreground">{{ a.cooldown_until || '—' }}</td>
-              <td class="px-3 py-3 text-center">{{ a.fail_count }}</td>
-              <td class="py-3 pr-5 text-muted-foreground">{{ a.source || '—' }}</td>
               <td class="px-3 py-3 text-center" data-account-action-menu>
                 <Button
                   size="xs"
@@ -959,7 +1287,7 @@ onUnmounted(() => {
               </td>
             </tr>
             <tr v-if="!loading && !filtered.length">
-              <td colspan="21" class="py-8 text-center text-sm text-muted-foreground">
+              <td :colspan="isAdmin ? 19 : 18" class="py-8 text-center text-sm text-muted-foreground">
                 暂无账号。可单独添加、批量导入，或通过推送接口同步。
               </td>
             </tr>
@@ -1006,6 +1334,14 @@ onUnmounted(() => {
             type="button"
             class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
             :disabled="busyId === actionMenuRow.id || batchBusy"
+            @click="runRowAction(actionMenuRow, 'editNick')"
+          >
+            改昵称
+          </button>
+          <button
+            type="button"
+            class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
+            :disabled="busyId === actionMenuRow.id || batchBusy"
             @click="runRowAction(actionMenuRow, 'refresh')"
           >
             刷新
@@ -1020,11 +1356,27 @@ onUnmounted(() => {
           </button>
           <button
             type="button"
-            class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60"
-            :disabled="busyId === actionMenuRow.id || batchBusy"
-            @click="runRowAction(actionMenuRow, 'toggleStatus')"
+            class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60 disabled:opacity-40"
+            :disabled="busyId === actionMenuRow.id || batchBusy || !canResumeDispatch(actionMenuRow)"
+            @click="runRowAction(actionMenuRow, 'enable')"
           >
-            {{ actionMenuRow.status === 'active' ? '禁用' : '启用' }}
+            启用调度
+          </button>
+          <button
+            type="button"
+            class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60 disabled:opacity-40"
+            :disabled="busyId === actionMenuRow.id || batchBusy || !canPauseDispatch(actionMenuRow)"
+            @click="runRowAction(actionMenuRow, 'disable')"
+          >
+            暂停调度
+          </button>
+          <button
+            type="button"
+            class="block w-full px-3 py-1.5 text-left text-xs hover:bg-muted/60 disabled:opacity-40"
+            :disabled="busyId === actionMenuRow.id || batchBusy || !hasCooldown(actionMenuRow)"
+            @click="runRowAction(actionMenuRow, 'clearCooldown')"
+          >
+            清除冷却
           </button>
           <button
             type="button"
@@ -1138,7 +1490,7 @@ onUnmounted(() => {
     <ModalShell
       :open="!!detail || detailLoading"
       title="账号详情"
-      :description="detail?.email || (detailLoading ? '加载中…' : '')"
+      :description="detail?.email || (detailLoading ? '加载中…' : '可直接修改并保存')"
       size-class="max-w-2xl"
       close-on-overlay
       @close="closeDetail"
@@ -1160,22 +1512,68 @@ onUnmounted(() => {
             :label="tokenLabel('RT', detail.has_refresh_token || !!detail.refresh_token)"
           />
         </div>
-        <div class="flex flex-wrap items-end gap-2 rounded-xl border border-border/70 bg-muted/20 px-3 py-2">
-          <label class="min-w-[8rem] flex-1 space-y-1.5">
-            <span class="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">并发上限</span>
-            <Input v-model="detailMaxConcurrency" type="number" block min="1" max="64" />
+
+        <div class="space-y-3 rounded-xl border border-border/70 bg-muted/20 px-3 py-3">
+          <p class="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">可编辑信息</p>
+          <label class="block space-y-1.5">
+            <span class="text-xs font-medium text-muted-foreground">邮箱</span>
+            <Input v-model="detailForm.email" type="text" block placeholder="保留原始大小写" />
           </label>
-          <Button
-            size="sm"
-            variant="outline"
-            :root-class="toolbarButtonClass"
-            :disabled="savingConcurrency || busyId === detail.id || batchBusy"
-            @click="saveDetailConcurrency"
-          >
-            {{ savingConcurrency ? '保存中…' : '保存并发' }}
-          </Button>
+          <label class="block space-y-1.5">
+            <span class="text-xs font-medium text-muted-foreground">密码</span>
+            <Input v-model="detailForm.password" type="text" block placeholder="明文密码" />
+          </label>
+          <label class="block space-y-1.5">
+            <span class="text-xs font-medium text-muted-foreground">昵称（本地）</span>
+            <Input v-model="detailForm.nick_name" type="text" block placeholder="可选" />
+          </label>
+          <div class="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <label class="block space-y-1.5">
+              <span class="text-xs font-medium text-muted-foreground">状态</span>
+              <select
+                v-model="detailForm.status"
+                class="h-10 w-full rounded-xl border border-border bg-background px-3 text-sm outline-none focus:border-primary"
+              >
+                <option value="active">active</option>
+                <option value="disabled">disabled</option>
+              </select>
+            </label>
+            <label class="block space-y-1.5">
+              <span class="text-xs font-medium text-muted-foreground">并发上限</span>
+              <Input v-model="detailForm.max_concurrency" type="number" block min="1" max="64" />
+            </label>
+            <label class="block space-y-1.5">
+              <span class="text-xs font-medium text-muted-foreground">出口 ID</span>
+              <Input v-model="detailForm.egress_id" type="number" block min="0" placeholder="0=清除" />
+            </label>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <label class="block space-y-1.5">
+              <span class="text-xs font-medium text-muted-foreground">来源</span>
+              <Input v-model="detailForm.source" type="text" block />
+            </label>
+            <label class="block space-y-1.5">
+              <span class="text-xs font-medium text-muted-foreground">外部 ID</span>
+              <Input v-model="detailForm.external_id" type="text" block />
+            </label>
+          </div>
+          <label class="block space-y-1.5">
+            <span class="text-xs font-medium text-muted-foreground">API Key</span>
+            <Input v-model="detailForm.api_key" type="text" block class="font-mono text-xs" />
+          </label>
+          <label class="block space-y-1.5">
+            <span class="text-xs font-medium text-muted-foreground">Access Token</span>
+            <Input v-model="detailForm.access_token" type="text" block class="font-mono text-xs" />
+          </label>
+          <label class="block space-y-1.5">
+            <span class="text-xs font-medium text-muted-foreground">Refresh Token</span>
+            <Input v-model="detailForm.refresh_token" type="text" block class="font-mono text-xs" />
+          </label>
         </div>
+
         <p v-if="error" class="text-sm text-[hsl(var(--tone-error-strong))]">{{ error }}</p>
+        <p v-if="okmsg" class="text-sm text-[hsl(var(--tone-success-strong))]">{{ okmsg }}</p>
+
         <dl class="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div
             v-for="f in detailFields"
@@ -1211,7 +1609,16 @@ onUnmounted(() => {
         >
           {{ detail?.has_api_key || detail?.api_key ? '重置 Key' : '登录补 Key' }}
         </Button>
-        <Button size="sm" variant="primary" :root-class="toolbarButtonClass" @click="closeDetail">关闭</Button>
+        <Button size="sm" variant="outline" :root-class="toolbarButtonClass" @click="closeDetail">关闭</Button>
+        <Button
+          size="sm"
+          variant="primary"
+          :root-class="toolbarButtonClass"
+          :disabled="!detail?.id || detailSaving || busyId === detail?.id || batchBusy"
+          @click="saveDetailAccount"
+        >
+          {{ detailSaving ? '保存中…' : '保存修改' }}
+        </Button>
       </template>
     </ModalShell>
   </div>

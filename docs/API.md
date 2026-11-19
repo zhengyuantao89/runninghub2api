@@ -51,7 +51,47 @@ curl -s -X POST $BASE/v1/images/generations \
     "size": "9:16",
     "quality": "1k"
   }'
-# 成功：{ "created":..., "data":[{"url":"https://..."}], "model":"nano-banana2-low-cost", "mode":"sync" }
+```
+
+同步成功响应（取 `data[0].url`）：
+
+```json
+{
+  "created": 1731744000,
+  "data": [{ "url": "https://.../output/image/xxx.png" }],
+  "id": "vid_xxx",
+  "object": "list",
+  "mode": "sync",
+  "model": "nano-banana2-low-cost",
+  "status": "succeeded"
+}
+```
+
+异步（`?async=1`）创建响应：
+
+```json
+{
+  "id": "vid_xxx",
+  "object": "image.generation",
+  "created": 1731744120,
+  "status": "queued",
+  "mode": "async",
+  "model": "gpt-image-2-low-cost",
+  "message": "async: poll GET /v1/images/vid_xxx"
+}
+```
+
+`GET /v1/images/{id}` 完成时：
+
+```json
+{
+  "id": "vid_xxx",
+  "object": "image.generation",
+  "status": "succeeded",
+  "mode": "async",
+  "data": [{ "url": "https://.../output/image/xxx.png" }],
+  "url": "https://.../output/image/xxx.png"
+}
 ```
 
 参考图（图生图）用 multipart：
@@ -64,7 +104,61 @@ curl -s -X POST $BASE/v1/images/generations \
   -F image=@./ref.png
 ```
 
-### 生视频（异步示例）
+### 生视频参数（官方试用 · Minimax H3-RH Enhanced）
+
+`POST /v1/videos`，只走官方免费试用模型时传下面字段（**不要**用应用模板的 `webapp_id` / `node_info_list`）。
+
+| 字段 | 必填 | 说明 | 默认 |
+|------|------|------|------|
+| `model` | 是 | `minimax-h3-rh-enhanced`（自由创作：无图=文生，有图=图生）<br>`minimax-h3-rh-enhanced-multimodal`（多模态参考） | `minimax-h3-rh-enhanced` |
+| `prompt` | 是 | 正向提示词，最长约 20000 | — |
+| `duration` / `seconds` | 否 | 时长秒数，范围 **4–15** | `4` |
+| `aspect_ratio` / `size` | 否 | 画面比例，见下表（建议传官网带标签完整值） | `3:2 (Photo)` |
+| `resolution` | 否 | `480p` / `768p` / `1080p`。**不传默认 `480p`（很糊），高清请显式传 `1080p`** | `480p` |
+| `image` / `image_base64` | 图生时建议 | 首帧 JPG/PNG | — |
+| `image_2`… / 多图字段 | 多模态 | 参考图 ≤9 | — |
+| `video` / `video_N` | 多模态 | 参考视频 ≤3 | — |
+| `audio` / `audio_N` | 多模态 | 参考音频 ≤3 | — |
+
+网关内部固定 `audioMode=native`（暂不开放下游改）。
+
+#### `aspect_ratio` / `size` 可选值（与官网试用模型一致）
+
+| 传值（推荐，官网原样） |
+|------------------------|
+| `1:1 (Square)` |
+| `2:3 (Portrait Photo)` |
+| `3:2 (Photo)` |
+| `3:4 (Portrait Standard)` |
+| `4:3 (Standard)` |
+| `9:16 (Portrait Widescreen)` |
+| `16:9 (Widescreen)` |
+| `21:9 (Ultrawide)` |
+
+也可传纯比例如 `3:4` / `9:16`；官网 UI 提交用的是带括号标签的完整字符串。
+
+#### `resolution`
+
+| 下游传值 | 说明 |
+|----------|------|
+| `480p` | 最低档（默认；画面很糊） |
+| `768p` | 中档 |
+| `1080p` | 最高档（推荐） |
+
+### 生视频（异步示例 · 图生，全参数）
+
+```bash
+curl -s -X POST $BASE/v1/videos \
+  -H "Authorization: Bearer $KEY" \
+  -F model=minimax-h3-rh-enhanced \
+  -F prompt='人物按首帧外貌缓慢转身，写实风格' \
+  -F duration=10 \
+  -F aspect_ratio='3:4 (Portrait Standard)' \
+  -F resolution=1080p \
+  -F image=@./first_frame.png
+```
+
+JSON（首图用 base64）：
 
 ```bash
 curl -s -X POST $BASE/v1/videos \
@@ -73,26 +167,91 @@ curl -s -X POST $BASE/v1/videos \
   -d '{
     "model": "minimax-h3-rh-enhanced",
     "prompt": "人物动起来",
-    "seconds": "4",
-    "size": "3:2 (Photo)"
+    "duration": "10",
+    "aspect_ratio": "3:4 (Portrait Standard)",
+    "resolution": "1080p",
+    "image_base64": "<PNG/JPG base64>"
   }'
-# → { "id":"vid_xxx", "object":"video", "status":"queued|in_progress", "mode":"async", "model":"..." }
-
-curl -s $BASE/v1/videos/vid_xxx -H "Authorization: Bearer $KEY"
-# 直到 status=succeeded，取 file_url
 ```
 
-多模态参考：
+文生视频（不传图即可）：
+
+```bash
+curl -s -X POST $BASE/v1/videos \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "minimax-h3-rh-enhanced",
+    "prompt": "阳光下女孩缓缓转身，写实风格",
+    "duration": "8",
+    "aspect_ratio": "9:16 (Portrait Widescreen)",
+    "resolution": "1080p"
+  }'
+```
+
+异步创建响应：
+
+```json
+{
+  "id": "vid_xxx",
+  "object": "video",
+  "created_at": 1731744000,
+  "status": "queued",
+  "mode": "async",
+  "model": "minimax-h3-rh-enhanced",
+  "rh_task_id": "",
+  "progress": 0,
+  "message": "async: poll GET /v1/videos/vid_xxx"
+}
+```
+
+```bash
+curl -s $BASE/v1/videos/vid_xxx -H "Authorization: Bearer $KEY"
+```
+
+查询完成时（内部任务字段；取 `file_url`）：
+
+```json
+{
+  "id": "vid_xxx",
+  "status": "succeeded",
+  "rh_task_id": "2118246629706653697",
+  "progress_text": "完成",
+  "file_url": "https://.../output/video/xxx.mp4",
+  "preview_url": "https://.../preview.jpg"
+}
+```
+
+同步（`?sync=1` 阻塞到成片）成功响应：
+
+```json
+{
+  "id": "vid_xxx",
+  "object": "video",
+  "status": "completed",
+  "mode": "sync",
+  "progress": 100,
+  "model": "minimax-h3-rh-enhanced",
+  "url": "https://.../output/video/xxx.mp4"
+}
+```
+
+多模态参考（图≤9 / 视频≤3 / 音频≤3；prompt 可用 `@Image N` / `@Video N` / `@Audio N` 引用，不强制）：
 
 ```bash
 curl -s -X POST $BASE/v1/videos \
   -H "Authorization: Bearer $KEY" \
   -F model=minimax-h3-rh-enhanced-multimodal \
-  -F prompt='人物动起来' \
-  -F seconds=4 \
-  -F image=@./a.png \
-  -F image_2=@./b.png
+  -F prompt='@Image 1这个是模特@Video 1这个是参考视频@Audio 1这个是口播音频，请根据参考视频和口播音频帮我复刻一个' \
+  -F duration=10 \
+  -F aspect_ratio='3:4 (Portrait Standard)' \
+  -F resolution=1080p \
+  -F image=@./model.png \
+  -F video=@./ref.mp4 \
+  -F audio=@./voice.wav
 ```
+
+创建响应形态与上方异步创建相同（`object=video`、`mode=async`）。
 
 ## 核心流程（任意 AI 应用 / 应用模板）
 

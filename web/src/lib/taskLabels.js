@@ -77,3 +77,86 @@ export function rhStatusLabel(rh) {
   if (!rh) return ''
   return RH_STATUS_ZH[rh] || rh
 }
+
+/** Our gateway-level codes (store.error_code). */
+const GATEWAY_ERROR_ZH = {
+  RH: '上游错误',
+  AUTH: '鉴权失败',
+  BUSY: '上游繁忙',
+  NO_COINS: '余额不足',
+  PROMPT: '提示词/校验',
+  TIMEOUT: '超时',
+  EGRESS: '出口失败',
+}
+
+/** Official RunningHub OpenAPI code → identifier (doc-8287467). */
+const RH_CODE_ID = {
+  301: 'PARAMS_INVALID',
+  380: 'WORKFLOW_NOT_EXISTS',
+  412: 'TOKEN_INVALID',
+  415: 'TASK_INSTANCE_MAXED',
+  416: 'NOT_ENOUGH_WALLET',
+  421: 'TASK_QUEUE_MAXED',
+  423: 'TASK_NOT_FOUND',
+  433: 'VALIDATE_PROMPT_FAILED',
+  435: 'EXCLAPI_INSTANCE_NOT_FOUND',
+  436: 'EXCLAPI_REQUIRED',
+  500: 'UNKNOWN_ERROR',
+  801: 'APIKEY_UNSUPPORTED_FREE_USER',
+  802: 'APIKEY_UNAUTHORIZED',
+  803: 'APIKEY_INVALID_NODE_INFO',
+  804: 'APIKEY_TASK_IS_RUNNING',
+  805: 'APIKEY_TASK_STATUS_ERROR',
+  806: 'APIKEY_USER_NOT_FOUND',
+  807: 'APIKEY_TASK_NOT_FOUND',
+  808: 'APIKEY_UPLOAD_FAILED',
+  809: 'APIKEY_FILE_SIZE_EXCEEDED',
+  810: 'WORKFLOW_NOT_SAVED',
+  811: 'CORPAPIKEY_INVALID',
+  812: 'CORPAPIKEY_INSUFFICIENT_FUNDS',
+  813: 'APIKEY_TASK_IS_QUEUED',
+  901: 'WEBAPP_NOT_EXISTS',
+  1000: 'UNKNOWN',
+  1005: 'INTERNAL_ERROR',
+  1011: 'SYSTEM_BUSY',
+  1501: 'CONTENT_VERIFICATION_FAILED',
+  1504: 'MODEL_TIMEOUT',
+  1505: 'REAL_PERSON_PROHIBITED',
+}
+
+/**
+ * Compact label for task queue "错误码" column.
+ * Prefer official RH msg/code from error text; else gateway error_code.
+ */
+export function errorCodeLabel(t) {
+  if (!t) return '—'
+  const raw = String(t.error || '')
+  const gate = String(t.error_code || '').trim().toUpperCase()
+
+  // msg=UNKNOWN_ERROR / msg=TOKEN_INVALID
+  const msgId = raw.match(/\bmsg=([A-Z][A-Z0-9_]{2,})\b/)
+  if (msgId) return msgId[1]
+
+  // code=433 → VALIDATE_PROMPT_FAILED (or raw code)
+  const codeNum = raw.match(/\bcode=(\d{3,4})\b/)
+  if (codeNum) {
+    const n = Number(codeNum[1])
+    return RH_CODE_ID[n] || String(n)
+  }
+
+  if (gate && gate !== 'RH') {
+    return GATEWAY_ERROR_ZH[gate] ? `${gate}` : gate
+  }
+  if (gate === 'RH') return 'RH'
+  return '—'
+}
+
+export function errorCodeTitle(t) {
+  if (!t) return ''
+  const parts = []
+  const code = errorCodeLabel(t)
+  if (code && code !== '—') parts.push(code)
+  if (t.error_code) parts.push(`gateway=${t.error_code}`)
+  if (t.error) parts.push(t.error)
+  return parts.join('\n')
+}

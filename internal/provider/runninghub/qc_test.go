@@ -1,6 +1,7 @@
 package runninghub
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -149,7 +150,7 @@ func TestResolveQCFreeVideoModel(t *testing.T) {
 }
 
 func TestBuildQCFreeCreateRequest(t *testing.T) {
-	req := buildQCFreeCreateRequest("人物动起来", []string{"https://cdn.example/a.png"}, "9:16", "4", "480p", QCFreeVideoModeFreeCreation, "p1", "page1", "req-1")
+	req := buildQCFreeCreateRequest("人物动起来", []string{"https://cdn.example/a.png"}, nil, nil, "9:16", "4", "480p", QCFreeVideoModeFreeCreation, "p1", "page1", "req-1")
 	if req["bindingId"] != DefaultQCFreeBindingID || req["skuId"] != DefaultQCFreeSkuID {
 		t.Fatalf("i2v ids %+v", req)
 	}
@@ -166,11 +167,14 @@ func TestBuildQCFreeCreateRequest(t *testing.T) {
 	if params["aspectRatio"] != "9:16" {
 		t.Fatalf("aspect=%v", params["aspectRatio"])
 	}
-	if params["resolution"] != "480p" || params["73##megapixels"] != "480p" {
-		t.Fatalf("resolution=%v megapixels=%v", params["resolution"], params["73##megapixels"])
+	if params["resolution"] != 0.135164359862 {
+		t.Fatalf("resolution=%v", params["resolution"])
+	}
+	if _, ok := params["73##megapixels"]; ok {
+		t.Fatal("73##megapixels should not be sent (HAR params omit it)")
 	}
 
-	t2v := buildQCFreeCreateRequest("人物动起来", nil, "3:2 (Photo)", "5", "768p", QCFreeVideoModeFreeCreation, "p1", "page1", "req-2")
+	t2v := buildQCFreeCreateRequest("人物动起来", nil, nil, nil, "3:2 (Photo)", "5", "768p", QCFreeVideoModeFreeCreation, "p1", "page1", "req-2")
 	if t2v["bindingId"] != DefaultQCFreeT2VBindingID || t2v["skuId"] != DefaultQCFreeT2VSkuID {
 		t.Fatalf("t2v ids %+v", t2v)
 	}
@@ -178,11 +182,11 @@ func TestBuildQCFreeCreateRequest(t *testing.T) {
 	if _, ok := p2["firstFrameUrl"]; ok {
 		t.Fatal("t2v must omit firstFrameUrl")
 	}
-	if p2["duration"] != 5 || p2["resolution"] != "768p" {
+	if p2["duration"] != 5 || p2["resolution"] != 0.346020761246 {
 		t.Fatalf("t2v params %+v", p2)
 	}
 
-	multi := buildQCFreeCreateRequest("人物动起来", []string{"https://cdn.example/a.png", "https://cdn.example/b.png"}, "1:1 (Square)", "5", "1080p", QCFreeVideoModeMultimodal, "p1", "page1", "req-3")
+	multi := buildQCFreeCreateRequest("人物动起来", []string{"https://cdn.example/a.png", "https://cdn.example/b.png"}, nil, nil, "1:1 (Square)", "5", "1080p", QCFreeVideoModeMultimodal, "p1", "page1", "req-3")
 	if multi["bindingId"] != DefaultQCFreeMultiBindingID || multi["skuId"] != DefaultQCFreeMultiSkuID {
 		t.Fatalf("multi ids %+v", multi)
 	}
@@ -192,6 +196,62 @@ func TestBuildQCFreeCreateRequest(t *testing.T) {
 	}
 	if _, ok := pm["firstFrameUrl"]; ok {
 		t.Fatal("multimodal must omit firstFrameUrl")
+	}
+
+	prompt := "@Image 1这个是模特@Video 1这个是参考视频@Audio 1这个是口播音频，请根据参考视频和口播音频帮我复刻一个"
+	multiAV := buildQCFreeCreateRequest(
+		prompt,
+		[]string{"https://cdn.example/a.png"},
+		[]string{"https://cdn.example/v.mp4"},
+		[]string{"https://cdn.example/a.wav"},
+		"3:4 (Portrait Standard)", "10", "1080p",
+		QCFreeVideoModeMultimodal, "p1", "page1", "req-av",
+	)
+	pav, _ := multiAV["params"].(map[string]any)
+	if pav["prompt"] != prompt {
+		t.Fatalf("prompt rewritten: %v", pav["prompt"])
+	}
+	if pav["refImage1"] != "https://cdn.example/a.png" || pav["refVideo1"] != "https://cdn.example/v.mp4" || pav["refAudio1"] != "https://cdn.example/a.wav" {
+		t.Fatalf("av params %+v", pav)
+	}
+	if _, ok := pav["refImage2"]; ok {
+		t.Fatal("unexpected refImage2")
+	}
+
+	videoOnly := buildQCFreeCreateRequest("only video", nil, []string{"https://cdn.example/v.mp4"}, nil, "1:1 (Square)", "5", "1080p", QCFreeVideoModeMultimodal, "p1", "page1", "req-v")
+	pv, _ := videoOnly["params"].(map[string]any)
+	if pv["refVideo1"] != "https://cdn.example/v.mp4" {
+		t.Fatalf("video-only %+v", pv)
+	}
+	if _, ok := pv["refImage1"]; ok {
+		t.Fatal("video-only must omit refImage1")
+	}
+}
+
+func TestSanitizeQCProjectName(t *testing.T) {
+	if got := sanitizeQCProjectName(""); got != "qc" {
+		t.Fatalf("empty=%q", got)
+	}
+	if got := sanitizeQCProjectName("  hello\r\nworld  "); got != "hello world" {
+		t.Fatalf("crlf=%q", got)
+	}
+	long := strings.Repeat("测", 300)
+	got := sanitizeQCProjectName(long)
+	runes := []rune(got)
+	if len(runes) != qcProjectNameMax+1 || runes[len(runes)-1] != '…' {
+		t.Fatalf("truncate got=%q len=%d", got, len(runes))
+	}
+}
+
+func TestQCFreeVideoMegapixels(t *testing.T) {
+	if qcFreeVideoMegapixels("480p") != 0.135164359862 {
+		t.Fatalf("480p=%v", qcFreeVideoMegapixels("480p"))
+	}
+	if qcFreeVideoMegapixels("768p") != 0.346020761246 {
+		t.Fatalf("768p=%v", qcFreeVideoMegapixels("768p"))
+	}
+	if qcFreeVideoMegapixels("") != 0.684269571799 {
+		t.Fatalf("default=%v", qcFreeVideoMegapixels(""))
 	}
 }
 
